@@ -1,0 +1,27 @@
+﻿services:
+  trust-router-sidecar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trust-router-sidecar:local
+    command: ["0.0.0.0:7878", "/audit/sidecar-audit.jsonl"]
+    ports:
+      - "7878:7878"
+    volumes:
+      - ./docker-data/audit:/audit
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7878/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  toy-agent:
+    image: python:3.13-slim
+    depends_on:
+      trust-router-sidecar:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./sdk/python:/app:ro
+    command: ["python", "/app/compose_agent.py"]
+
