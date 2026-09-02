@@ -1,4 +1,4 @@
-﻿# Trust Router
+# Trust Router
 
 Trust Router is a deterministic routing core for agent/tool workflows. It is built to reduce LLM control-plane calls by routing routine work through a cost-weighted graph, then escalating to an LLM only when no feasible path exists.
 
@@ -205,6 +205,15 @@ Run it against a live sidecar:
 $env:TRUST_ROUTER_URL = "http://127.0.0.1:7878"
 python sdk/python/langchain_integration_example.py
 ```
+Run the live escalation example:
+
+```powershell
+$env:TRUST_ROUTER_URL = "http://127.0.0.1:7878"
+$env:TRUST_ROUTER_API_KEY = "trust-router-demo-key"
+python sdk/python/escalation_example.py
+```
+
+This intentionally opens both search paths and shows the SDK caller the explicit `{"decision":"escalate"}` response rather than a silent failure.
 
 ## TypeScript SDK Stub
 
@@ -218,6 +227,48 @@ node --experimental-strip-types sdk/typescript/exampleUsage.ts
 ```
 
 This script asks the sidecar for the primary path, reports enough `primary_search` failures to open that node, then confirms the next route deterministically uses `fallback_search`.
+
+
+## Production Readiness
+
+Implemented and tested:
+
+- Deterministic routing core with explicit escalation.
+- Circuit-breaker health states and automatic half-open recovery.
+- Durable JSONL audit records.
+- Sidecar API with metrics and shared API-key protection.
+- Rust unit tests, integration tests, HTTP chaos tests, load tests, and live SDK checks.
+
+Explicitly not done yet:
+
+- Per-tenant customer credentials and authorization beyond the shared key.
+- TLS termination inside the sidecar.
+- Horizontal scaling, clustering, or distributed route cache.
+- Persistent graph/health/cache state across process restarts.
+- Real external network conditions beyond the local mock chaos server.
+- Full OpenTelemetry export, cargo-fuzz harness, replay simulation mode, and long soak reports.
+
+## How To Verify Everything Yourself
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\verify.ps1
+cargo run --bin trust-router-loadtest
+cargo run --bin trust-router-demo -- demo-audit.jsonl
+cargo run --bin trust-router-baseline
+```
+
+With a sidecar running:
+
+```powershell
+cargo run --bin trust-router-sidecar -- 127.0.0.1:7878 sidecar-audit.jsonl
+$env:TRUST_ROUTER_API_KEY = "trust-router-demo-key"
+python sdk/python/example_usage.py
+python sdk/python/langchain_integration_example.py
+python sdk/python/escalation_example.py
+node --experimental-strip-types sdk/typescript/exampleUsage.ts
+```
+
+Docker, fuzzing, and replay commands should be run only after their required local tooling exists.
 
 ## Core Model
 
@@ -307,4 +358,5 @@ cargo test
 - Load test: route many concurrent workflows and measure decision latency.
 - False escalation test: verify the router does not escalate when a valid degraded-but-available path exists.
 - Statistical baseline: run each task 20-30 times per arm and report mean/stddev for success rate and LLM-call count.
+
 

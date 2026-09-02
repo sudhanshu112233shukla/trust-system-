@@ -1,4 +1,4 @@
-﻿$previousTrustRouterApiKey = $env:TRUST_ROUTER_API_KEY
+$previousTrustRouterApiKey = $env:TRUST_ROUTER_API_KEY
 $env:TRUST_ROUTER_API_KEY = "trust-router-demo-key"
 
 $ErrorActionPreference = "Stop"
@@ -84,6 +84,30 @@ finally {
 }
 
 
+
+$escalationSidecar = Start-Process `
+    -FilePath ".\target\debug\trust-router-sidecar.exe" `
+    -ArgumentList @("127.0.0.1:7881", "escalation-sidecar-audit.jsonl") `
+    -PassThru `
+    -NoNewWindow
+
+try {
+    $previousTrustRouterUrl = $env:TRUST_ROUTER_URL
+    $env:TRUST_ROUTER_URL = "http://127.0.0.1:7881"
+    Invoke-Checked python sdk/python/escalation_example.py
+}
+finally {
+    if ($null -ne $previousTrustRouterUrl) {
+        $env:TRUST_ROUTER_URL = $previousTrustRouterUrl
+    } else {
+        Remove-Item Env:\TRUST_ROUTER_URL -ErrorAction SilentlyContinue
+    }
+
+    if ($null -ne $escalationSidecar -and -not $escalationSidecar.HasExited) {
+        Stop-Process -Id $escalationSidecar.Id -Force
+        Wait-Process -Id $escalationSidecar.Id -ErrorAction SilentlyContinue
+    }
+}
 if ($null -ne $previousTrustRouterApiKey) {
     $env:TRUST_ROUTER_API_KEY = $previousTrustRouterApiKey
 } else {
@@ -91,4 +115,6 @@ if ($null -ne $previousTrustRouterApiKey) {
 }
 
 Write-Host "Trust Router verification completed successfully."
+
+
 
