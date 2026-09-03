@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: trust-router-sidecar
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: TRUST_ROUTER_API_KEY
+        sync: false
+      - key: TRUST_ROUTER_RATE_LIMIT_PER_MINUTE
+        value: "120"

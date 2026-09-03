@@ -1,0 +1,12 @@
+﻿{
+  "name": "trust-router-sdk-checks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tsc": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}

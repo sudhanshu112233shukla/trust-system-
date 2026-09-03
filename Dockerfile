@@ -17,9 +17,9 @@ RUN apt-get update \
 
 COPY --from=builder /app/target/release/trust-router-sidecar /usr/local/bin/trust-router-sidecar
 
+WORKDIR /audit
 USER trust-router
 EXPOSE 7878
 VOLUME ["/audit"]
 
 ENTRYPOINT ["/usr/local/bin/trust-router-sidecar"]
-CMD ["0.0.0.0:7878", "/audit/sidecar-audit.jsonl"]

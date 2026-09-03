@@ -1,13 +1,20 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use trust_router::{AuditEvent, Edge, RouteDecision, Router, append_events_jsonl};
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router as AxumRouter};
+use serde::{Deserialize, Serialize};
+use tracing::{error, info};
+use trust_router::{AuditEvent, Edge, RouteDecision, Router as TrustRouter, append_events_jsonl};
 
 const DEFAULT_API_KEY: &str = "trust-router-demo-key";
+const DEFAULT_ADDRESS: &str = "127.0.0.1:7878";
+const TENANT: &str = "yc-demo";
 const KNOWN_NODES: [&str; 5] = [
     "start",
     "primary_search",
@@ -16,320 +23,248 @@ const KNOWN_NODES: [&str; 5] = [
     "done",
 ];
 
-fn main() -> std::io::Result<()> {
-    let address = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:7878".to_string());
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt().with_target(false).init();
+
+    let address = sidecar_address();
     let audit_path = std::env::args()
         .nth(2)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("sidecar-audit.jsonl"));
-    let api_key =
-        std::env::var("TRUST_ROUTER_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+    let api_key = std::env::var("TRUST_ROUTER_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.into());
     let router = build_demo_router();
     let metrics = Arc::new(Mutex::new(Metrics::default()));
-    let listener = TcpListener::bind(&address)?;
+    let state = AppState {
+        router,
+        audit_path,
+        api_key,
+        metrics,
+    };
 
-    println!("Trust Router sidecar listening on http://{address}");
-    println!("Audit file: {}", audit_path.display());
+    let app = AxumRouter::new()
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_handler))
+        .route("/route", get(route_handler).post(route_handler))
+        .route("/result", get(result_handler).post(result_handler))
+        .route(
+            "/force-half-open",
+            get(force_half_open_handler).post(force_half_open_handler),
+        )
+        .with_state(Arc::new(state));
+
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let local_addr = listener.local_addr()?;
+    info!(%local_addr, "Trust Router sidecar listening");
+    println!("Trust Router sidecar listening on http://{local_addr}");
     println!("Protected endpoints require X-API-Key.");
-    println!("Try: http://{address}/route?tenant=yc-demo&start=start&goal=done");
+    println!("Audit file: {}", app_state_audit_hint());
+    println!("Try: http://{local_addr}/route?tenant=yc-demo&start=start&goal=done");
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => handle_connection(stream, &router, &audit_path, &metrics, &api_key),
-            Err(error) => eprintln!("connection failed: {error}"),
-        }
-    }
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     Ok(())
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
-    router: &Router,
-    audit_path: &PathBuf,
-    metrics: &Arc<Mutex<Metrics>>,
-    api_key: &str,
-) {
-    let mut buffer = [0; 2048];
-    let Ok(read) = stream.read(&mut buffer) else {
-        return;
-    };
-    if read == 0 {
-        return;
+fn sidecar_address() -> String {
+    std::env::args().nth(1).unwrap_or_else(|| {
+        std::env::var("PORT")
+            .map(|port| format!("0.0.0.0:{port}"))
+            .unwrap_or_else(|_| DEFAULT_ADDRESS.to_string())
+    })
+}
+
+fn app_state_audit_hint() -> String {
+    std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "sidecar-audit.jsonl".to_string())
+}
+
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        error!(%error, "failed to install shutdown signal handler");
     }
+    info!("shutdown signal received");
+}
 
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let Some(request_line) = request.lines().next() else {
-        write_error_response(
-            &mut stream,
-            SidecarError::BadRequest("missing request line".to_string()),
-        );
-        return;
-    };
+#[derive(Clone)]
+struct AppState {
+    router: TrustRouter,
+    audit_path: PathBuf,
+    api_key: String,
+    metrics: Arc<Mutex<Metrics>>,
+}
 
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or_default();
-    let (path, query) = split_target(target);
-    let headers = parse_headers(&request);
+async fn healthz() -> Json<HealthResponse> {
+    Json(HealthResponse { ok: true })
+}
 
-    let response = match (method, path) {
-        ("GET", "/healthz") => Ok("{\"ok\":true}".to_string()),
-        ("GET", "/metrics") => {
-            require_api_key(&headers, api_key).and_then(|_| handle_metrics(router, metrics))
+async fn metrics_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match require_api_key(&headers, &state.api_key) {
+        Ok(()) => {
+            let metrics = state.metrics.lock().expect("metrics lock poisoned");
+            Json(metrics.to_response(&state.router)).into_response()
         }
-        ("GET" | "POST", "/route") => require_api_key(&headers, api_key)
-            .and_then(|_| handle_route(router, audit_path, metrics, &query)),
-        ("GET" | "POST", "/result") => {
-            require_api_key(&headers, api_key).and_then(|_| handle_result(router, &query))
-        }
-        ("GET" | "POST", "/force-half-open") => {
-            require_api_key(&headers, api_key).and_then(|_| handle_force_half_open(router, &query))
-        }
-        _ => Err(SidecarError::NotFound(format!(
-            "unknown endpoint: {method} {path}"
-        ))),
-    };
-
-    match response {
-        Ok(body) => write_response(&mut stream, 200, &body),
-        Err(error) => write_error_response(&mut stream, error),
+        Err(error) => error.into_response(),
     }
+}
+
+async fn route_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<RouteQuery>,
+) -> Response {
+    match require_api_key(&headers, &state.api_key).and_then(|_| query.validate()) {
+        Ok(()) => handle_route(&state, query).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn result_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ResultQuery>,
+) -> Response {
+    match require_api_key(&headers, &state.api_key).and_then(|_| query.validate()) {
+        Ok(()) => {
+            state
+                .router
+                .record_result(&query.tenant, &query.node, query.success, query.latency_ms);
+            Json(OkResponse { ok: true }).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn force_half_open_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ForceHalfOpenQuery>,
+) -> Response {
+    match require_api_key(&headers, &state.api_key).and_then(|_| query.validate()) {
+        Ok(()) => {
+            let changed = state.router.force_half_open(&query.tenant, &query.node);
+            Json(ForceHalfOpenResponse { changed }).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+fn handle_route(state: &AppState, query: RouteQuery) -> Result<Json<RouteResponse>, SidecarError> {
+    let started = Instant::now();
+    let decision = state.router.route(&query.tenant, &query.start, &query.goal);
+    let elapsed = started.elapsed();
+    let event = state
+        .router
+        .last_audit_event()
+        .ok_or_else(|| SidecarError::Internal("route did not create an audit event".into()))?;
+    persist_before_response(&state.audit_path, event)?;
+
+    let response = RouteResponse::from_decision(decision.clone());
+    let mut metrics = state.metrics.lock().expect("metrics lock poisoned");
+    metrics.record_route(&query.tenant, &decision, elapsed, &state.router);
+    Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteQuery {
+    tenant: String,
+    start: String,
+    goal: String,
+}
+
+impl RouteQuery {
+    fn validate(&self) -> Result<(), SidecarError> {
+        validate_identifier("tenant", &self.tenant)?;
+        validate_identifier("start", &self.start)?;
+        validate_identifier("goal", &self.goal)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResultQuery {
+    tenant: String,
+    node: String,
+    success: bool,
+    latency_ms: u64,
+}
+
+impl ResultQuery {
+    fn validate(&self) -> Result<(), SidecarError> {
+        validate_identifier("tenant", &self.tenant)?;
+        validate_identifier("node", &self.node)?;
+        if self.latency_ms > 600_000 {
+            return Err(SidecarError::BadRequest("latency_ms is too large".into()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ForceHalfOpenQuery {
+    tenant: String,
+    node: String,
+}
+
+impl ForceHalfOpenQuery {
+    fn validate(&self) -> Result<(), SidecarError> {
+        validate_identifier("tenant", &self.tenant)?;
+        validate_identifier("node", &self.node)?;
+        Ok(())
+    }
+}
+
+fn validate_identifier(field: &str, value: &str) -> Result<(), SidecarError> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(SidecarError::BadRequest(format!(
+            "{field} must be 1-128 characters"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(SidecarError::BadRequest(format!(
+            "{field} contains invalid characters"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
 enum SidecarError {
     BadRequest(String),
     Unauthorized,
-    NotFound(String),
+    Internal(String),
 }
 
-impl SidecarError {
-    fn status(&self) -> u16 {
-        match self {
-            SidecarError::BadRequest(_) => 400,
-            SidecarError::Unauthorized => 401,
-            SidecarError::NotFound(_) => 404,
-        }
-    }
-
-    fn message(&self) -> &str {
-        match self {
-            SidecarError::BadRequest(message) | SidecarError::NotFound(message) => message,
-            SidecarError::Unauthorized => "missing or invalid API key",
-        }
-    }
-}
-
-fn handle_route(
-    router: &Router,
-    audit_path: &PathBuf,
-    metrics: &Arc<Mutex<Metrics>>,
-    query: &HashMap<String, String>,
-) -> Result<String, SidecarError> {
-    let tenant = required(query, "tenant")?;
-    let start = required(query, "start")?;
-    let goal = required(query, "goal")?;
-    let started = Instant::now();
-    let decision = router.route(tenant, start, goal);
-    let elapsed = started.elapsed();
-    let event = router.last_audit_event().ok_or_else(|| {
-        SidecarError::BadRequest("route did not create an audit event".to_string())
-    })?;
-    persist_before_response(audit_path, event)?;
-
-    let mut metrics = metrics.lock().expect("metrics lock poisoned");
-    metrics.record_route(&decision, elapsed);
-    drop(metrics);
-
-    Ok(route_decision_json(decision))
-}
-
-fn handle_result(router: &Router, query: &HashMap<String, String>) -> Result<String, SidecarError> {
-    let tenant = required(query, "tenant")?;
-    let node = required(query, "node")?;
-    let success = required(query, "success")?
-        .parse::<bool>()
-        .map_err(|_| SidecarError::BadRequest("success must be true or false".to_string()))?;
-    let latency_ms = required(query, "latency_ms")?
-        .parse::<u64>()
-        .map_err(|_| SidecarError::BadRequest("latency_ms must be an integer".to_string()))?;
-
-    router.record_result(tenant, node, success, latency_ms);
-    Ok("{\"ok\":true}".to_string())
-}
-
-fn handle_force_half_open(
-    router: &Router,
-    query: &HashMap<String, String>,
-) -> Result<String, SidecarError> {
-    let tenant = required(query, "tenant")?;
-    let node = required(query, "node")?;
-    let changed = router.force_half_open(tenant, node);
-    Ok(format!("{{\"changed\":{changed}}}"))
-}
-
-fn handle_metrics(router: &Router, metrics: &Arc<Mutex<Metrics>>) -> Result<String, SidecarError> {
-    let metrics = metrics.lock().expect("metrics lock poisoned");
-    Ok(metrics.to_json(router, "yc-demo"))
-}
-
-fn route_decision_json(decision: RouteDecision) -> String {
-    match decision {
-        RouteDecision::Routed(route) => format!(
-            "{{\"decision\":\"routed\",\"path\":{},\"total_cost\":{},\"cache_hit\":{}}}",
-            json_string_array(&route.nodes),
-            route.total_cost,
-            route.cache_hit
-        ),
-        RouteDecision::Escalate(context) => format!(
-            "{{\"decision\":\"escalate\",\"reason\":\"{:?}\",\"failed_or_blocked_nodes\":{}}}",
-            context.reason,
-            json_string_array(&context.failed_or_blocked_nodes)
-        ),
-    }
-}
-
-#[derive(Debug, Default)]
-struct Metrics {
-    total_routes: u64,
-    total_reroutes: u64,
-    total_escalations: u64,
-    route_latencies: Vec<Duration>,
-}
-
-impl Metrics {
-    fn record_route(&mut self, decision: &RouteDecision, latency: Duration) {
-        self.total_routes += 1;
-        match decision {
-            RouteDecision::Routed(_) => self.total_reroutes += 1,
-            RouteDecision::Escalate(_) => self.total_escalations += 1,
-        }
-        self.route_latencies.push(latency);
-    }
-
-    fn to_json(&self, router: &Router, tenant: &str) -> String {
-        let escalation_rate = if self.total_routes == 0 {
-            0.0
-        } else {
-            self.total_escalations as f64 / self.total_routes as f64
+impl IntoResponse for SidecarError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            SidecarError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            SidecarError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid API key".into(),
+            ),
+            SidecarError::Internal(message) => {
+                error!(%message, "sidecar internal error");
+                (StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
         };
-        let llm_calls_avoided = self.total_routes.saturating_sub(self.total_escalations);
-        let mut sorted = self.route_latencies.clone();
-        sorted.sort_unstable();
-
-        format!(
-            "{{\"total_routes\":{},\"total_reroutes\":{},\"total_escalations\":{},\"escalation_rate\":{},\"llm_calls_avoided\":{},\"node_health\":{},\"route_latency_us\":{{\"p50\":{},\"p95\":{},\"p99\":{}}}}}",
-            self.total_routes,
-            self.total_reroutes,
-            self.total_escalations,
-            escalation_rate,
-            llm_calls_avoided,
-            node_health_json(router, tenant),
-            percentile_us(&sorted, 50.0),
-            percentile_us(&sorted, 95.0),
-            percentile_us(&sorted, 99.0)
-        )
+        (status, Json(ErrorResponse { error: message })).into_response()
     }
 }
 
-fn node_health_json(router: &Router, tenant: &str) -> String {
-    let items: Vec<_> = KNOWN_NODES
-        .iter()
-        .map(|node| {
-            let state = router
-                .node_state(tenant, node)
-                .map(|state| format!("{state:?}"))
-                .unwrap_or_else(|| "Healthy".to_string());
-            format!("\"{}\":\"{}\"", json_escape(node), state)
-        })
-        .collect();
-    format!("{{{}}}", items.join(","))
-}
-
-fn percentile_us(values: &[Duration], percentile: f64) -> u128 {
-    if values.is_empty() {
-        return 0;
-    }
-
-    let index = ((values.len() - 1) as f64 * percentile / 100.0).round() as usize;
-    values[index].as_micros()
-}
-
-fn build_demo_router() -> Router {
-    let router = Router::new();
-    router.add_tenant("yc-demo");
-    router.add_edge(
-        "yc-demo",
-        Edge::new("start", "primary_search").with_costs(1.0, 0.001, 120, 0.1),
-    );
-    router.add_edge(
-        "yc-demo",
-        Edge::new("primary_search", "summarize").with_costs(1.0, 0.002, 320, 0.2),
-    );
-    router.add_edge(
-        "yc-demo",
-        Edge::new("start", "fallback_search").with_costs(10.0, 0.01, 1_000, 1.0),
-    );
-    router.add_edge(
-        "yc-demo",
-        Edge::new("fallback_search", "summarize").with_costs(5.0, 0.005, 800, 0.5),
-    );
-    router.add_edge(
-        "yc-demo",
-        Edge::new("summarize", "done").with_costs(1.0, 0.001, 120, 0.1),
-    );
-    router
-}
-
-fn persist_before_response(path: &PathBuf, event: AuditEvent) -> Result<(), SidecarError> {
-    append_events_jsonl(path, &[event])
-        .map(|_| ())
-        .map_err(|error| SidecarError::BadRequest(format!("audit persistence failed: {error}")))
-}
-
-fn split_target(target: &str) -> (&str, HashMap<String, String>) {
-    let Some((path, query)) = target.split_once('?') else {
-        return (target, HashMap::new());
-    };
-
-    let query = query
-        .split('&')
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            Some((url_decode(key), url_decode(value)))
-        })
-        .collect();
-
-    (path, query)
-}
-
-fn required<'a>(query: &'a HashMap<String, String>, key: &str) -> Result<&'a str, SidecarError> {
-    query
-        .get(key)
-        .map(String::as_str)
-        .ok_or_else(|| SidecarError::BadRequest(format!("missing query parameter: {key}")))
-}
-
-fn parse_headers(request: &str) -> HashMap<String, String> {
-    request
-        .lines()
-        .skip(1)
-        .take_while(|line| !line.is_empty())
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
-        })
-        .collect()
-}
-
-fn require_api_key(headers: &HashMap<String, String>, expected: &str) -> Result<(), SidecarError> {
-    let Some(actual) = headers.get("x-api-key") else {
+fn require_api_key(headers: &HeaderMap, expected: &str) -> Result<(), SidecarError> {
+    let Some(actual) = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+    else {
         return Err(SidecarError::Unauthorized);
     };
-
     constant_time_eq(actual.as_bytes(), expected.as_bytes())
         .then_some(())
         .ok_or(SidecarError::Unauthorized)
@@ -338,75 +273,263 @@ fn require_api_key(headers: &HashMap<String, String>, expected: &str) -> Result<
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let max_len = left.len().max(right.len());
     let mut diff = left.len() ^ right.len();
-
     for index in 0..max_len {
         let left_byte = left.get(index).copied().unwrap_or(0);
         let right_byte = right.get(index).copied().unwrap_or(0);
         diff |= (left_byte ^ right_byte) as usize;
     }
-
     diff == 0
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        _ => "Internal Server Error",
-    };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
+fn persist_before_response(path: &PathBuf, event: AuditEvent) -> Result<(), SidecarError> {
+    append_events_jsonl(path, &[event])
+        .map(|_| ())
+        .map_err(|error| SidecarError::Internal(format!("audit persistence failed: {error}")))
 }
 
-fn write_error_response(stream: &mut TcpStream, error: SidecarError) {
-    write_response(
-        stream,
-        error.status(),
-        &format!("{{\"error\":\"{}\"}}", json_escape(error.message())),
-    );
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    ok: bool,
 }
 
-fn json_string_array(values: &[String]) -> String {
-    let items: Vec<_> = values
-        .iter()
-        .map(|value| format!("\"{}\"", json_escape(value)))
-        .collect();
-    format!("[{}]", items.join(","))
+#[derive(Debug, Serialize)]
+struct OkResponse {
+    ok: bool,
 }
 
-fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
 }
 
-fn url_decode(value: &str) -> String {
-    let mut output = String::new();
-    let mut chars = value.chars();
+#[derive(Debug, Serialize)]
+struct ForceHalfOpenResponse {
+    changed: bool,
+}
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            '+' => output.push(' '),
-            '%' => {
-                let hi = chars.next();
-                let lo = chars.next();
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    if let Ok(byte) = u8::from_str_radix(&format!("{hi}{lo}"), 16) {
-                        output.push(byte as char);
-                    }
-                }
-            }
-            _ => output.push(ch),
+#[derive(Debug, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+enum RouteResponse {
+    Routed {
+        path: Vec<String>,
+        total_cost: f64,
+        cache_hit: bool,
+    },
+    Escalate {
+        reason: String,
+        failed_or_blocked_nodes: Vec<String>,
+    },
+}
+
+impl RouteResponse {
+    fn from_decision(decision: RouteDecision) -> Self {
+        match decision {
+            RouteDecision::Routed(route) => Self::Routed {
+                path: route.nodes,
+                total_cost: route.total_cost,
+                cache_hit: route.cache_hit,
+            },
+            RouteDecision::Escalate(context) => Self::Escalate {
+                reason: format!("{:?}", context.reason),
+                failed_or_blocked_nodes: context.failed_or_blocked_nodes,
+            },
         }
     }
+}
 
-    output
+#[derive(Debug, Default)]
+struct Metrics {
+    total_routes: u64,
+    total_reroutes: u64,
+    total_escalations: u64,
+    false_escalations: u64,
+    per_tenant: HashMap<String, TenantMetrics>,
+    route_latencies: Vec<Duration>,
+}
+
+impl Metrics {
+    fn record_route(
+        &mut self,
+        tenant: &str,
+        decision: &RouteDecision,
+        latency: Duration,
+        router: &TrustRouter,
+    ) {
+        self.total_routes += 1;
+        let tenant_metrics = self.per_tenant.entry(tenant.to_string()).or_default();
+        tenant_metrics.total_routes += 1;
+        match decision {
+            RouteDecision::Routed(_) => {
+                self.total_reroutes += 1;
+                tenant_metrics.total_reroutes += 1;
+            }
+            RouteDecision::Escalate(_) => {
+                self.total_escalations += 1;
+                tenant_metrics.total_escalations += 1;
+                if penalty_path_available(router, tenant) {
+                    self.false_escalations += 1;
+                    tenant_metrics.false_escalations += 1;
+                }
+            }
+        }
+        self.route_latencies.push(latency);
+        tenant_metrics.route_latencies.push(latency);
+    }
+
+    fn to_response(&self, router: &TrustRouter) -> MetricsResponse {
+        let mut sorted = self.route_latencies.clone();
+        sorted.sort_unstable();
+        let tenants = self
+            .per_tenant
+            .iter()
+            .map(|(tenant, metrics)| (tenant.clone(), metrics.to_response(router, tenant)))
+            .collect::<HashMap<_, _>>();
+        MetricsResponse {
+            total_routes: self.total_routes,
+            total_reroutes: self.total_reroutes,
+            total_escalations: self.total_escalations,
+            escalation_rate: rate(self.total_escalations, self.total_routes),
+            llm_calls_avoided: self.total_routes.saturating_sub(self.total_escalations),
+            false_escalations: self.false_escalations,
+            false_escalation_rate: rate(self.false_escalations, self.total_routes),
+            node_health: node_health(router, TENANT),
+            route_latency_us: LatencyPercentiles::from_sorted(&sorted),
+            tenants,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TenantMetrics {
+    total_routes: u64,
+    total_reroutes: u64,
+    total_escalations: u64,
+    false_escalations: u64,
+    route_latencies: Vec<Duration>,
+}
+
+impl TenantMetrics {
+    fn to_response(&self, router: &TrustRouter, tenant: &str) -> TenantMetricsResponse {
+        let mut sorted = self.route_latencies.clone();
+        sorted.sort_unstable();
+        TenantMetricsResponse {
+            total_routes: self.total_routes,
+            total_reroutes: self.total_reroutes,
+            total_escalations: self.total_escalations,
+            escalation_rate: rate(self.total_escalations, self.total_routes),
+            llm_calls_avoided: self.total_routes.saturating_sub(self.total_escalations),
+            false_escalations: self.false_escalations,
+            false_escalation_rate: rate(self.false_escalations, self.total_routes),
+            node_health: node_health(router, tenant),
+            route_latency_us: LatencyPercentiles::from_sorted(&sorted),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MetricsResponse {
+    total_routes: u64,
+    total_reroutes: u64,
+    total_escalations: u64,
+    escalation_rate: f64,
+    llm_calls_avoided: u64,
+    false_escalations: u64,
+    false_escalation_rate: f64,
+    node_health: HashMap<String, String>,
+    route_latency_us: LatencyPercentiles,
+    tenants: HashMap<String, TenantMetricsResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct TenantMetricsResponse {
+    total_routes: u64,
+    total_reroutes: u64,
+    total_escalations: u64,
+    escalation_rate: f64,
+    llm_calls_avoided: u64,
+    false_escalations: u64,
+    false_escalation_rate: f64,
+    node_health: HashMap<String, String>,
+    route_latency_us: LatencyPercentiles,
+}
+
+#[derive(Debug, Serialize)]
+struct LatencyPercentiles {
+    p50: u128,
+    p95: u128,
+    p99: u128,
+}
+
+impl LatencyPercentiles {
+    fn from_sorted(values: &[Duration]) -> Self {
+        Self {
+            p50: percentile_us(values, 50.0),
+            p95: percentile_us(values, 95.0),
+            p99: percentile_us(values, 99.0),
+        }
+    }
+}
+
+fn rate(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn percentile_us(values: &[Duration], percentile: f64) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    let index = ((values.len() - 1) as f64 * percentile / 100.0).round() as usize;
+    values[index].as_micros()
+}
+
+fn node_health(router: &TrustRouter, tenant: &str) -> HashMap<String, String> {
+    KNOWN_NODES
+        .iter()
+        .map(|node| {
+            let state = router
+                .node_state(tenant, node)
+                .map(|state| format!("{state:?}"))
+                .unwrap_or_else(|| "Healthy".to_string());
+            ((*node).to_string(), state)
+        })
+        .collect()
+}
+
+fn penalty_path_available(router: &TrustRouter, tenant: &str) -> bool {
+    KNOWN_NODES.iter().any(|node| {
+        router
+            .node_state(tenant, node)
+            .map(|state| matches!(format!("{state:?}").as_str(), "Degraded" | "HalfOpen"))
+            .unwrap_or(false)
+    })
+}
+
+fn build_demo_router() -> TrustRouter {
+    let router = TrustRouter::new();
+    router.add_tenant(TENANT);
+    router.add_edge(
+        TENANT,
+        Edge::new("start", "primary_search").with_costs(1.0, 0.001, 120, 0.1),
+    );
+    router.add_edge(
+        TENANT,
+        Edge::new("primary_search", "summarize").with_costs(1.0, 0.002, 320, 0.2),
+    );
+    router.add_edge(
+        TENANT,
+        Edge::new("start", "fallback_search").with_costs(10.0, 0.01, 1_000, 1.0),
+    );
+    router.add_edge(
+        TENANT,
+        Edge::new("fallback_search", "summarize").with_costs(5.0, 0.005, 800, 0.5),
+    );
+    router.add_edge(
+        TENANT,
+        Edge::new("summarize", "done").with_costs(1.0, 0.001, 120, 0.1),
+    );
+    router
 }

@@ -1,8 +1,8 @@
-# Trust Router
+﻿# Trust Router
 
 Trust Router is a deterministic routing core for agent/tool workflows. It is built to reduce LLM control-plane calls by routing routine work through a cost-weighted graph, then escalating to an LLM only when no feasible path exists.
 
-The current crate is the routing core, not a UI prototype. It focuses on the parts that must be correct before adding REST, gRPC, SDKs, or dashboards:
+The current crate includes the production routing core plus a local Axum REST sidecar. It focuses on the parts that must be correct before adding hosted dashboards or deeper customer-specific integrations:
 
 - Multi-tenant tool graphs.
 - Tenant-configurable, normalized cost-aware shortest-path routing.
@@ -12,7 +12,8 @@ The current crate is the routing core, not a UI prototype. It focuses on the par
 - Thread-safe route and health updates using a standard-library `RwLock`.
 - Explicit audit events for reroutes and escalations.
 - Escalation context that can later be passed to an LLM.
-- Demo binaries for CLI scenario playback, statistical baseline comparison, and a minimal local sidecar.
+- Demo binaries for CLI scenario playback and statistical baseline comparison.
+- An Axum REST sidecar for local deployment, SDK verification, metrics, and audit persistence.
 
 Multi-tenancy here means graph and health-state isolation only. It does not yet include authentication, authorization, billing isolation, or network-level tenant security.
 
@@ -70,8 +71,8 @@ Example endpoints:
 
 ```text
 GET  /healthz
-GET  /metrics
-GET  /route?tenant=yc-demo&start=start&goal=done
+GET  /metrics  # requires X-API-Key
+GET  /route?tenant=yc-demo&start=start&goal=done  # requires X-API-Key
 POST /result?tenant=yc-demo&node=primary_search&success=false&latency_ms=1000  # requires X-API-Key
 POST /force-half-open?tenant=yc-demo&node=primary_search  # requires X-API-Key
 ```
@@ -87,6 +88,8 @@ Sample `/metrics` response after four route decisions, one forced fallback route
   "total_escalations": 1,
   "escalation_rate": 0.25,
   "llm_calls_avoided": 3,
+  "false_escalations": 0,
+  "false_escalation_rate": 0.0,
   "node_health": {
     "start": "Healthy",
     "primary_search": "Open",
@@ -98,6 +101,29 @@ Sample `/metrics` response after four route decisions, one forced fallback route
     "p50": 84,
     "p95": 142,
     "p99": 142
+  },
+  "tenants": {
+    "yc-demo": {
+      "total_routes": 4,
+      "total_reroutes": 3,
+      "total_escalations": 1,
+      "escalation_rate": 0.25,
+      "llm_calls_avoided": 3,
+      "false_escalations": 0,
+      "false_escalation_rate": 0.0,
+      "node_health": {
+        "start": "Healthy",
+        "primary_search": "Open",
+        "fallback_search": "Open",
+        "summarize": "Healthy",
+        "done": "Healthy"
+      },
+      "route_latency_us": {
+        "p50": 84,
+        "p95": 142,
+        "p99": 142
+      }
+    }
   }
 }
 ```
@@ -109,8 +135,11 @@ Metrics fields:
 - `total_escalations`: `/route` calls that had no feasible path and would require LLM recovery.
 - `escalation_rate`: `total_escalations / total_routes`.
 - `llm_calls_avoided`: route decisions handled without LLM escalation.
+- `false_escalations`: escalations where the sidecar observed a penalized node state at decision time; this should stay at zero in the current verified graph because degraded and half-open nodes remain routable.
+- `false_escalation_rate`: `false_escalations / total_routes`.
 - `node_health`: current sidecar process health state for each demo graph node.
 - `route_latency_us`: p50/p95/p99 decision latency in microseconds, measured around the route decision path.
+- `tenants`: the same counters broken down per tenant.
 
 
 ## Sidecar Authentication
@@ -171,6 +200,17 @@ Run an HTTP load test against the containerized sidecar:
 python scripts/container_loadtest.py
 ```
 
+## Deploying To Render
+
+This repository includes render.yaml for a Docker-based Render Web Service.
+
+1. In Render, create a Blueprint from this GitHub repository.
+2. Set TRUST_ROUTER_API_KEY to a long random secret in the Render dashboard. Do not use the checked-in demo key.
+3. Deploy. Render supplies PORT automatically; the sidecar binds to 0.0.0.0 on that port.
+4. Confirm GET /healthz returns {"ok":true}. All other endpoints require X-API-Key.
+
+The Render Free plan is suitable for demonstrations only. It can sleep when idle and local audit JSONL files are ephemeral, so audit history and in-memory health state are not durable across a restart. Use managed storage and a paid always-on service before relying on it for customer workloads.
+
 ## Python SDK Stub
 
 The minimal client in `sdk/python/trust_router_client.py` wraps the sidecar's `/route` and `/result` endpoints with `requests`.
@@ -215,6 +255,17 @@ python sdk/python/escalation_example.py
 
 This intentionally opens both search paths and shows the SDK caller the explicit `{"decision":"escalate"}` response rather than a silent failure.
 
+
+## Optional Python Provider Integrations
+
+`sdk/python/integrations.py` adds three optional integration helpers on top of the raw SDK:
+
+- `RoutedToolExecutor`: routes a named tool registry through Trust Router before execution.
+- `OpenAIEscalationAdapter`: uses the official `openai` Python SDK only after Trust Router returns an explicit escalation.
+- `McpToolInterceptor`: wraps an MCP SDK `ClientSession.call_tool` flow so MCP tool execution reports success/failure back to Trust Router.
+
+The local verifier imports these adapters successfully. A real OpenAI recovery call still requires `OPENAI_API_KEY` and a selected model. LangChain itself is not installed on this machine, so the checked live tool-loop example remains the hand-rolled LangChain-style stand-in rather than a real LangChain package demo.
+
 ## TypeScript SDK Stub
 
 The TypeScript client in `sdk/typescript/trustRouterClient.ts` mirrors the Python SDK with `route(start, goal)` and `reportResult(node, success, latencyMs)` methods over the sidecar REST API.
@@ -223,6 +274,7 @@ Run the live sidecar verification script:
 
 ```powershell
 $env:TRUST_ROUTER_URL = "http://127.0.0.1:7878"
+npm run tsc
 node --experimental-strip-types sdk/typescript/exampleUsage.ts
 ```
 
@@ -236,7 +288,7 @@ Implemented and tested:
 - Deterministic routing core with explicit escalation.
 - Circuit-breaker health states and automatic half-open recovery.
 - Durable JSONL audit records.
-- Sidecar API with metrics and shared API-key protection.
+- Axum sidecar API with metrics, per-tenant metric breakdowns, graceful Ctrl+C shutdown, and shared API-key protection.
 - Rust unit tests, integration tests, HTTP chaos tests, load tests, and live SDK checks.
 
 Explicitly not done yet:
@@ -265,6 +317,7 @@ $env:TRUST_ROUTER_API_KEY = "trust-router-demo-key"
 python sdk/python/example_usage.py
 python sdk/python/langchain_integration_example.py
 python sdk/python/escalation_example.py
+npm run tsc
 node --experimental-strip-types sdk/typescript/exampleUsage.ts
 ```
 
@@ -348,7 +401,7 @@ cargo test
 ## Known Limitations
 
 - The current `Arc<RwLock>` design uses one coarse router-state lock, so concurrent traffic is safe but not per-node or per-tenant fine-grained yet. If `trust-router-loadtest` shows contention under realistic workloads, the next optimization target is splitting locks by tenant and then by graph, health state, and path cache.
-- The local sidecar is intentionally minimal demo infrastructure. Production deployment should replace it with a real REST or gRPC service, request validation, authn/authz, structured observability, and bounded request bodies.
+- The sidecar is now a real Axum REST service, but it still uses single shared-key auth and in-memory graph/health/cache state. Per-customer auth, persistent state, TLS termination, and horizontal scaling remain outside this demo build.
 
 ## Real Scenario Test Plan
 
@@ -358,5 +411,9 @@ cargo test
 - Load test: route many concurrent workflows and measure decision latency.
 - False escalation test: verify the router does not escalate when a valid degraded-but-available path exists.
 - Statistical baseline: run each task 20-30 times per arm and report mean/stddev for success rate and LLM-call count.
+
+
+
+
 
 

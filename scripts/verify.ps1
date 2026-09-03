@@ -1,4 +1,4 @@
-$previousTrustRouterApiKey = $env:TRUST_ROUTER_API_KEY
+﻿$previousTrustRouterApiKey = $env:TRUST_ROUTER_API_KEY
 $env:TRUST_ROUTER_API_KEY = "trust-router-demo-key"
 
 $ErrorActionPreference = "Stop"
@@ -27,6 +27,7 @@ $sidecar = Start-Process `
 
 try {
     Invoke-Checked python sdk/python/example_usage.py
+    Invoke-Checked python sdk/python/integration_import_check.py
 }
 finally {
     if ($null -ne $sidecar -and -not $sidecar.HasExited) {
@@ -68,6 +69,8 @@ $typescriptSidecar = Start-Process `
 try {
     $previousTrustRouterUrl = $env:TRUST_ROUTER_URL
     $env:TRUST_ROUTER_URL = "http://127.0.0.1:7880"
+    & npm run tsc
+    if ($LASTEXITCODE -ne 0) { throw "Command failed with exit code ${LASTEXITCODE}: npm run tsc" }
     Invoke-Checked node --experimental-strip-types sdk/typescript/exampleUsage.ts
 }
 finally {
@@ -115,6 +118,9 @@ if ($null -ne $previousTrustRouterApiKey) {
 }
 
 Write-Host "Trust Router verification completed successfully."
+
+
+
 
 
 

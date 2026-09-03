@@ -2,3 +2,4 @@
 *.jsonl
 docker-data/
 sdk/python/__pycache__/
+node_modules/
