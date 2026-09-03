@@ -237,7 +237,7 @@ else:
             raise
 ```
 
-`sdk/python/langchain_integration_example.py` is a live sidecar integration that sits one level above the raw SDK. LangChain is not installed on this machine, so it uses a minimal hand-rolled `Tool` stand-in with the same basic shape needed for this demo: named callable tools. The script delegates tool order to Trust Router, intentionally fails `primary_search`, reports the failure to the sidecar, reroutes to `fallback_search`, then completes `summarize` without any LLM control-flow call.
+`sdk/python/langchain_integration_example.py` is a live sidecar integration that sits one level above the raw SDK. The example uses `langchain_core.tools.Tool` when `langchain-core` is installed, and falls back to a small local stand-in only on machines without that package. The script delegates tool order to Trust Router, intentionally fails `primary_search`, reports the failure to the sidecar, reroutes to `fallback_search`, then completes `summarize` without any LLM control-flow call.
 
 Run it against a live sidecar:
 
@@ -264,7 +264,7 @@ This intentionally opens both search paths and shows the SDK caller the explicit
 - `OpenAIEscalationAdapter`: uses the official `openai` Python SDK only after Trust Router returns an explicit escalation.
 - `McpToolInterceptor`: wraps an MCP SDK `ClientSession.call_tool` flow so MCP tool execution reports success/failure back to Trust Router.
 
-The local verifier imports these adapters successfully. A real OpenAI recovery call still requires `OPENAI_API_KEY` and a selected model. LangChain itself is not installed on this machine, so the checked live tool-loop example remains the hand-rolled LangChain-style stand-in rather than a real LangChain package demo.
+The local verifier imports these adapters successfully. `openai`, `mcp`, `langchain-core`, and `langchain-openai` are installed on this machine, so the local examples use real installed provider packages where credentials are not required. A live OpenAI recovery call still requires `OPENAI_API_KEY` and a selected model.
 
 ## TypeScript SDK Stub
 
@@ -281,6 +281,73 @@ node --experimental-strip-types sdk/typescript/exampleUsage.ts
 This script asks the sidecar for the primary path, reports enough `primary_search` failures to open that node, then confirms the next route deterministically uses `fallback_search`.
 
 
+
+## OpenTelemetry Metrics Export
+
+The sidecar can export the same operational counters exposed by `/metrics` through OpenTelemetry stdout metrics. This is a local, verifiable exporter path and is separate from the durable JSONL audit log.
+
+Enable it with environment variables before starting the sidecar:
+
+```powershell
+$env:TRUST_ROUTER_OTEL_STDOUT = "true"
+$env:TRUST_ROUTER_OTEL_INTERVAL_MS = "1000"
+cargo run --bin trust-router-sidecar -- 127.0.0.1:7878 sidecar-audit.jsonl
+```
+
+Exported metric names include:
+
+- `trust_router_routes_total`
+- `trust_router_reroutes_total`
+- `trust_router_escalations_total`
+- `trust_router_false_escalations_total`
+- `trust_router_llm_calls_avoided_total`
+- `trust_router_route_decision_latency_us`
+- `trust_router_node_health_state`
+
+Local proof command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\otel-stdout-check.ps1
+```
+
+Verified result: `OpenTelemetry stdout metrics export verified.`
+
+For production monitoring stacks, the next step is swapping the stdout exporter for an OTLP collector exporter. The JSONL audit log remains the trust record; OTel metrics are operational telemetry.
+
+## Soak Test
+
+The wider multi-agent soak harness runs concurrent routing while continuously failing and recovering 2-3 nodes at a time across a denser graph.
+
+Short verifier run:
+
+```powershell
+cargo run --bin trust-router-soaktest -- 10 100
+```
+
+Verified local result:
+
+```text
+routes=188765
+escalations=0
+result_updates=377530
+failure_transitions=427
+recovery_transitions=427
+panics=0
+deadlocks_detected=false
+p50_us=55
+p95_us=117
+p99_us=466
+contention_observed=false
+```
+
+Full five-minute run:
+
+```powershell
+cargo run --bin trust-router-soaktest -- 300 200
+```
+
+Because the short verified run did not show contention, the router still keeps the coarse `RwLock`; replacing it with tenant-level locks or `DashMap` would be speculative right now.
+
 ## Production Readiness
 
 Implemented and tested:
@@ -288,7 +355,7 @@ Implemented and tested:
 - Deterministic routing core with explicit escalation.
 - Circuit-breaker health states and automatic half-open recovery.
 - Durable JSONL audit records.
-- Axum sidecar API with metrics, per-tenant metric breakdowns, graceful Ctrl+C shutdown, and shared API-key protection.
+- Axum sidecar API with metrics, per-tenant metric breakdowns, false-escalation counters, OpenTelemetry stdout export, graceful Ctrl+C shutdown, and shared API-key protection.
 - Rust unit tests, integration tests, HTTP chaos tests, load tests, and live SDK checks.
 
 Explicitly not done yet:
@@ -298,7 +365,7 @@ Explicitly not done yet:
 - Horizontal scaling, clustering, or distributed route cache.
 - Persistent graph/health/cache state across process restarts.
 - Real external network conditions beyond the local mock chaos server.
-- Full OpenTelemetry export, cargo-fuzz harness, replay simulation mode, and long soak reports.
+- OTLP collector export, cargo-fuzz harness, replay simulation mode, and a committed 5-minute soak report artifact.
 
 ## How To Verify Everything Yourself
 
@@ -411,6 +478,7 @@ cargo test
 - Load test: route many concurrent workflows and measure decision latency.
 - False escalation test: verify the router does not escalate when a valid degraded-but-available path exists.
 - Statistical baseline: run each task 20-30 times per arm and report mean/stddev for success rate and LLM-call count.
+
 
 
 

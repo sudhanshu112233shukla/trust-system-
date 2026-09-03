@@ -17,7 +17,9 @@ Invoke-Checked cargo test
 Invoke-Checked cargo run --bin trust-router-demo -- demo-audit.jsonl
 Invoke-Checked cargo run --bin trust-router-baseline
 Invoke-Checked cargo run --bin trust-router-loadtest
+Invoke-Checked cargo run --bin trust-router-soaktest -- 10 100
 Invoke-Checked cargo build --bins
+Invoke-Checked powershell -ExecutionPolicy Bypass -File .\scripts\otel-stdout-check.ps1
 
 $sidecar = Start-Process `
     -FilePath ".\target\debug\trust-router-sidecar.exe" `
@@ -118,6 +120,7 @@ if ($null -ne $previousTrustRouterApiKey) {
 }
 
 Write-Host "Trust Router verification completed successfully."
+
 
 
 

@@ -5,7 +5,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 import requests
 
@@ -17,19 +17,28 @@ from trust_router_client import TrustRouterClient
 OPEN_THRESHOLD = 5
 
 
+class InvokableTool(Protocol):
+    name: str
+
+    def invoke(self, input_text: str) -> str: ...
+
+
 @dataclass(frozen=True)
-class Tool:
-    """Minimal LangChain Tool stand-in.
-
-    LangChain is not installed on this machine, so this intentionally models
-    the same small surface this demo needs: a named callable tool.
-    """
-
+class StandInTool:
     name: str
     func: Callable[[str], str]
 
     def invoke(self, input_text: str) -> str:
         return self.func(input_text)
+
+
+def make_tool(name: str, func: Callable[[str], str]) -> InvokableTool:
+    try:
+        from langchain_core.tools import Tool
+
+        return Tool.from_function(name=name, description=f"Demo tool {name}", func=func)
+    except ImportError:
+        return StandInTool(name=name, func=func)
 
 
 class IntentionalToolFailure(RuntimeError):
@@ -78,9 +87,9 @@ def main() -> None:
         return f"summary({input_text})"
 
     tools = {
-        "primary_search": Tool("primary_search", primary_search),
-        "fallback_search": Tool("fallback_search", fallback_search),
-        "summarize": Tool("summarize", summarize),
+        "primary_search": make_tool("primary_search", primary_search),
+        "fallback_search": make_tool("fallback_search", fallback_search),
+        "summarize": make_tool("summarize", summarize),
     }
 
     task_input = "find routing evidence"
@@ -98,9 +107,6 @@ def main() -> None:
             executed_tools.append(tool_name)
             client.report_result(tool_name, success=True, latency_ms=100)
         except IntentionalToolFailure:
-            # One failed invocation is not enough to open the circuit breaker.
-            # Repeat the same health report to model consecutive real failures
-            # from the same tool and force deterministic rerouting.
             for _ in range(OPEN_THRESHOLD):
                 client.report_result(tool_name, success=False, latency_ms=30_000)
             rerouted = client.route("start", "done")
@@ -120,9 +126,12 @@ def main() -> None:
     assert "summarize" in executed_tools, executed_tools
     assert llm_decision_calls == 0
 
+    integration_kind = (
+        "langchain_core_tool" if tools["primary_search"].__class__.__module__.startswith("langchain_core") else "hand_rolled_tool_stand_in"
+    )
     print(f"executed_tools={executed_tools}")
     print(f"final_output={cursor}")
-    print("langchain_style_integration=hand_rolled_tool_stand_in")
+    print(f"langchain_style_integration={integration_kind}")
     print("llm_decision_calls=0")
     print("LangChain-style integration verified live sidecar reroute.")
 

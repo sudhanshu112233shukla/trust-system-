@@ -8,9 +8,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router as AxumRouter};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
-use trust_router::{AuditEvent, Edge, RouteDecision, Router as TrustRouter, append_events_jsonl};
+use trust_router::{
+    AuditEvent, Edge, NodeState, RouteDecision, Router as TrustRouter, append_events_jsonl,
+};
 
 const DEFAULT_API_KEY: &str = "trust-router-demo-key";
 const DEFAULT_ADDRESS: &str = "127.0.0.1:7878";
@@ -34,12 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from("sidecar-audit.jsonl"));
     let api_key = std::env::var("TRUST_ROUTER_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.into());
     let router = build_demo_router();
+    let otel = OtelMetrics::from_env(&router);
     let metrics = Arc::new(Mutex::new(Metrics::default()));
     let state = AppState {
         router,
         audit_path,
         api_key,
         metrics,
+        otel,
     };
 
     let app = AxumRouter::new()
@@ -95,6 +102,7 @@ struct AppState {
     audit_path: PathBuf,
     api_key: String,
     metrics: Arc<Mutex<Metrics>>,
+    otel: Option<Arc<OtelMetrics>>,
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -132,6 +140,9 @@ async fn result_handler(
             state
                 .router
                 .record_result(&query.tenant, &query.node, query.success, query.latency_ms);
+            if let Some(otel) = &state.otel {
+                otel.record_node_health(&query.tenant, &state.router);
+            }
             Json(OkResponse { ok: true }).into_response()
         }
         Err(error) => error.into_response(),
@@ -146,6 +157,11 @@ async fn force_half_open_handler(
     match require_api_key(&headers, &state.api_key).and_then(|_| query.validate()) {
         Ok(()) => {
             let changed = state.router.force_half_open(&query.tenant, &query.node);
+            if changed {
+                if let Some(otel) = &state.otel {
+                    otel.record_node_health(&query.tenant, &state.router);
+                }
+            }
             Json(ForceHalfOpenResponse { changed }).into_response()
         }
         Err(error) => error.into_response(),
@@ -164,7 +180,17 @@ fn handle_route(state: &AppState, query: RouteQuery) -> Result<Json<RouteRespons
 
     let response = RouteResponse::from_decision(decision.clone());
     let mut metrics = state.metrics.lock().expect("metrics lock poisoned");
-    metrics.record_route(&query.tenant, &decision, elapsed, &state.router);
+    let false_escalation = metrics.record_route(&query.tenant, &decision, elapsed, &state.router);
+    drop(metrics);
+    if let Some(otel) = &state.otel {
+        otel.record_route(
+            &query.tenant,
+            &decision,
+            elapsed,
+            false_escalation,
+            &state.router,
+        );
+    }
     Ok(Json(response))
 }
 
@@ -354,10 +380,11 @@ impl Metrics {
         decision: &RouteDecision,
         latency: Duration,
         router: &TrustRouter,
-    ) {
+    ) -> bool {
         self.total_routes += 1;
         let tenant_metrics = self.per_tenant.entry(tenant.to_string()).or_default();
         tenant_metrics.total_routes += 1;
+        let mut false_escalation = false;
         match decision {
             RouteDecision::Routed(_) => {
                 self.total_reroutes += 1;
@@ -366,7 +393,8 @@ impl Metrics {
             RouteDecision::Escalate(_) => {
                 self.total_escalations += 1;
                 tenant_metrics.total_escalations += 1;
-                if penalty_path_available(router, tenant) {
+                false_escalation = penalty_path_available(router, tenant);
+                if false_escalation {
                     self.false_escalations += 1;
                     tenant_metrics.false_escalations += 1;
                 }
@@ -374,6 +402,7 @@ impl Metrics {
         }
         self.route_latencies.push(latency);
         tenant_metrics.route_latencies.push(latency);
+        false_escalation
     }
 
     fn to_response(&self, router: &TrustRouter) -> MetricsResponse {
@@ -470,6 +499,115 @@ impl LatencyPercentiles {
     }
 }
 
+#[derive(Debug)]
+struct OtelMetrics {
+    _provider: SdkMeterProvider,
+    route_total: Counter<u64>,
+    reroute_total: Counter<u64>,
+    escalation_total: Counter<u64>,
+    false_escalation_total: Counter<u64>,
+    llm_calls_avoided_total: Counter<u64>,
+    route_latency_us: Histogram<f64>,
+    node_health_state: Gauge<u64>,
+}
+
+impl OtelMetrics {
+    fn from_env(router: &TrustRouter) -> Option<Arc<Self>> {
+        if !matches!(
+            std::env::var("TRUST_ROUTER_OTEL_STDOUT").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "YES")
+        ) {
+            return None;
+        }
+
+        let exporter = opentelemetry_stdout::MetricExporter::default();
+        let reader = PeriodicReader::builder(exporter)
+            .with_interval(otel_interval())
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let meter = provider.meter("trust-router-sidecar");
+        let metrics = Arc::new(Self {
+            _provider: provider,
+            route_total: meter.u64_counter("trust_router_routes_total").build(),
+            reroute_total: meter.u64_counter("trust_router_reroutes_total").build(),
+            escalation_total: meter.u64_counter("trust_router_escalations_total").build(),
+            false_escalation_total: meter
+                .u64_counter("trust_router_false_escalations_total")
+                .build(),
+            llm_calls_avoided_total: meter
+                .u64_counter("trust_router_llm_calls_avoided_total")
+                .build(),
+            route_latency_us: meter
+                .f64_histogram("trust_router_route_decision_latency_us")
+                .build(),
+            node_health_state: meter.u64_gauge("trust_router_node_health_state").build(),
+        });
+        metrics.record_node_health(TENANT, router);
+        info!("OpenTelemetry stdout metrics export enabled");
+        Some(metrics)
+    }
+
+    fn record_route(
+        &self,
+        tenant: &str,
+        decision: &RouteDecision,
+        latency: Duration,
+        false_escalation: bool,
+        router: &TrustRouter,
+    ) {
+        let attrs = [KeyValue::new("tenant", tenant.to_string())];
+        self.route_total.add(1, &attrs);
+        self.route_latency_us
+            .record(latency.as_micros() as f64, &attrs);
+        match decision {
+            RouteDecision::Routed(_) => {
+                self.reroute_total.add(1, &attrs);
+                self.llm_calls_avoided_total.add(1, &attrs);
+            }
+            RouteDecision::Escalate(_) => {
+                self.escalation_total.add(1, &attrs);
+                if false_escalation {
+                    self.false_escalation_total.add(1, &attrs);
+                }
+            }
+        }
+        self.record_node_health(tenant, router);
+    }
+
+    fn record_node_health(&self, tenant: &str, router: &TrustRouter) {
+        for node in KNOWN_NODES {
+            let state = router
+                .node_state(tenant, node)
+                .unwrap_or(NodeState::Healthy);
+            self.node_health_state.record(
+                node_state_value(state),
+                &[
+                    KeyValue::new("tenant", tenant.to_string()),
+                    KeyValue::new("node", node.to_string()),
+                    KeyValue::new("state", format!("{state:?}")),
+                ],
+            );
+        }
+    }
+}
+
+fn otel_interval() -> Duration {
+    std::env::var("TRUST_ROUTER_OTEL_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(60))
+}
+
+fn node_state_value(state: NodeState) -> u64 {
+    match state {
+        NodeState::Healthy => 0,
+        NodeState::Degraded => 1,
+        NodeState::HalfOpen => 2,
+        NodeState::Open => 3,
+    }
+}
+
 fn rate(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
         0.0
@@ -503,7 +641,7 @@ fn penalty_path_available(router: &TrustRouter, tenant: &str) -> bool {
     KNOWN_NODES.iter().any(|node| {
         router
             .node_state(tenant, node)
-            .map(|state| matches!(format!("{state:?}").as_str(), "Degraded" | "HalfOpen"))
+            .map(|state| matches!(state, NodeState::Degraded | NodeState::HalfOpen))
             .unwrap_or(false)
     })
 }
