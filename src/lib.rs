@@ -1,5 +1,6 @@
 pub mod escalation;
 pub mod health_monitor;
+pub mod sidecar_config;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -22,6 +23,72 @@ pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
 pub const LATENCY_SAMPLE_LIMIT: usize = 128;
 pub const ROUTE_CACHE_LIMIT: usize = 1024;
 pub const AUDIT_EVENT_MEMORY_LIMIT: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthPolicy {
+    pub open_threshold: u32,
+    pub degraded_threshold: u32,
+    pub half_open_success_needed: u32,
+    pub degraded_success_needed: u32,
+    pub cooldown: Duration,
+}
+
+impl Default for HealthPolicy {
+    fn default() -> Self {
+        Self {
+            open_threshold: OPEN_THRESHOLD,
+            degraded_threshold: DEGRADED_THRESHOLD,
+            half_open_success_needed: HALF_OPEN_SUCCESS_NEEDED,
+            degraded_success_needed: DEGRADED_SUCCESS_NEEDED,
+            cooldown: DEFAULT_COOLDOWN,
+        }
+    }
+}
+
+impl HealthPolicy {
+    pub fn validate(self) -> Result<(), RouterError> {
+        if self.degraded_threshold == 0 || self.open_threshold == 0 {
+            return Err(RouterError::InvalidHealthPolicy(
+                "failure thresholds must be greater than zero",
+            ));
+        }
+        if self.degraded_threshold > self.open_threshold {
+            return Err(RouterError::InvalidHealthPolicy(
+                "degraded_threshold cannot exceed open_threshold",
+            ));
+        }
+        if self.half_open_success_needed == 0 || self.degraded_success_needed == 0 {
+            return Err(RouterError::InvalidHealthPolicy(
+                "success thresholds must be greater than zero",
+            ));
+        }
+        if self.cooldown.is_zero() {
+            return Err(RouterError::InvalidHealthPolicy(
+                "cooldown must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouterError {
+    InvalidCostModel(&'static str),
+    InvalidHealthPolicy(&'static str),
+}
+
+impl std::fmt::Display for RouterError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCostModel(message) => write!(formatter, "invalid cost model: {message}"),
+            Self::InvalidHealthPolicy(message) => {
+                write!(formatter, "invalid health policy: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RouterError {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostWeights {
@@ -71,6 +138,41 @@ impl Default for TenantCostModel {
             weights: CostWeights::default(),
             ceilings: CostCeilings::default(),
         }
+    }
+}
+
+impl TenantCostModel {
+    pub fn validate(self) -> Result<(), RouterError> {
+        let weights = [
+            self.weights.w_dollar,
+            self.weights.w_latency,
+            self.weights.w_risk,
+            self.weights.w_base,
+        ];
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+        {
+            return Err(RouterError::InvalidCostModel(
+                "weights must be finite and non-negative",
+            ));
+        }
+        if weights.iter().all(|weight| *weight == 0.0) {
+            return Err(RouterError::InvalidCostModel(
+                "at least one weight must be greater than zero",
+            ));
+        }
+        if !self.ceilings.max_dollar.is_finite()
+            || !self.ceilings.max_base.is_finite()
+            || self.ceilings.max_dollar <= 0.0
+            || self.ceilings.max_base <= 0.0
+            || self.ceilings.max_latency_ms == 0
+        {
+            return Err(RouterError::InvalidCostModel(
+                "ceilings must be finite and greater than zero",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -124,6 +226,9 @@ impl Edge {
     }
 
     pub fn weight(&self, cost_model: TenantCostModel) -> f64 {
+        if !self.is_valid() || cost_model.validate().is_err() {
+            return f64::INFINITY;
+        }
         let ceilings = cost_model.ceilings;
         let weights = cost_model.weights;
         let dollar = normalize(self.dollar_cost, ceilings.max_dollar);
@@ -173,6 +278,15 @@ impl Default for HealthTracker {
 
 impl HealthTracker {
     pub fn record_result(&mut self, success: bool, latency_ms: u64) -> bool {
+        self.record_result_with_policy(success, latency_ms, HealthPolicy::default())
+    }
+
+    pub fn record_result_with_policy(
+        &mut self,
+        success: bool,
+        latency_ms: u64,
+        policy: HealthPolicy,
+    ) -> bool {
         let previous_state = self.state;
         self.record_latency_sample(latency_ms);
 
@@ -181,11 +295,15 @@ impl HealthTracker {
             self.consecutive_failures = 0;
             self.success_rate = ((self.success_rate * 9.0) + 1.0) / 10.0;
             match self.state {
-                NodeState::HalfOpen if self.consecutive_successes >= HALF_OPEN_SUCCESS_NEEDED => {
+                NodeState::HalfOpen
+                    if self.consecutive_successes >= policy.half_open_success_needed =>
+                {
                     self.state = NodeState::Healthy;
                     self.opened_at = None;
                 }
-                NodeState::Degraded if self.consecutive_successes >= DEGRADED_SUCCESS_NEEDED => {
+                NodeState::Degraded
+                    if self.consecutive_successes >= policy.degraded_success_needed =>
+                {
                     self.state = NodeState::Healthy;
                     self.opened_at = None;
                 }
@@ -196,8 +314,8 @@ impl HealthTracker {
             self.consecutive_successes = 0;
             self.success_rate = (self.success_rate * 9.0) / 10.0;
             self.state = match self.consecutive_failures {
-                failures if failures >= OPEN_THRESHOLD => NodeState::Open,
-                failures if failures >= DEGRADED_THRESHOLD => NodeState::Degraded,
+                failures if failures >= policy.open_threshold => NodeState::Open,
+                failures if failures >= policy.degraded_threshold => NodeState::Degraded,
                 _ => self.state,
             };
             if self.state == NodeState::Open && previous_state != NodeState::Open {
@@ -388,10 +506,33 @@ impl Router {
     }
 
     pub fn set_cost_model(&self, tenant_id: impl Into<TenantId>, cost_model: TenantCostModel) {
+        let _ = self.try_set_cost_model(tenant_id, cost_model);
+    }
+
+    pub fn try_set_cost_model(
+        &self,
+        tenant_id: impl Into<TenantId>,
+        cost_model: TenantCostModel,
+    ) -> Result<(), RouterError> {
+        cost_model.validate()?;
         let mut state = self.write_state();
         let tenant = state.tenants.entry(tenant_id.into()).or_default();
         tenant.cost_model = cost_model;
         tenant.invalidate_all_cache();
+        Ok(())
+    }
+
+    pub fn try_set_health_policy(
+        &self,
+        tenant_id: impl Into<TenantId>,
+        policy: HealthPolicy,
+    ) -> Result<(), RouterError> {
+        policy.validate()?;
+        let mut state = self.write_state();
+        let tenant = state.tenants.entry(tenant_id.into()).or_default();
+        tenant.health_policy = policy;
+        tenant.invalidate_all_cache();
+        Ok(())
     }
 
     pub fn add_edge(&self, tenant_id: impl Into<TenantId>, edge: Edge) {
@@ -413,7 +554,8 @@ impl Router {
         let mut state = self.write_state();
         let tenant = state.tenants.entry(tenant_id.clone()).or_default();
         let tracker = tenant.health.entry(node_id.clone()).or_default();
-        let state_changed = tracker.record_result(success, latency_ms);
+        let state_changed =
+            tracker.record_result_with_policy(success, latency_ms, tenant.health_policy);
         let node_state = tracker.state;
 
         if state_changed {
@@ -638,6 +780,7 @@ struct TenantState {
     cache: HashMap<RouteKey, CachedPath>,
     cache_order: VecDeque<RouteKey>,
     cost_model: TenantCostModel,
+    health_policy: HealthPolicy,
 }
 
 impl TenantState {
@@ -859,6 +1002,49 @@ mod tests {
         let model = TenantCostModel::default();
 
         assert!((edge.weight(model) - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn rejects_invalid_cost_models_without_replacing_the_current_model() {
+        let router = sample_router();
+        let invalid = TenantCostModel {
+            weights: CostWeights {
+                w_dollar: f64::NAN,
+                ..CostWeights::default()
+            },
+            ..TenantCostModel::default()
+        };
+
+        assert!(router.try_set_cost_model("acme", invalid).is_err());
+        assert!(matches!(
+            router.route("acme", "start", "done"),
+            RouteDecision::Routed(_)
+        ));
+    }
+
+    #[test]
+    fn applies_a_validated_tenant_health_policy() {
+        let router = sample_router();
+        router
+            .try_set_health_policy(
+                "acme",
+                HealthPolicy {
+                    open_threshold: 2,
+                    degraded_threshold: 1,
+                    half_open_success_needed: 2,
+                    degraded_success_needed: 1,
+                    cooldown: Duration::from_millis(10),
+                },
+            )
+            .expect("policy is valid");
+
+        router.record_result("acme", "search", false, 100);
+        assert_eq!(
+            router.node_state("acme", "search"),
+            Some(NodeState::Degraded)
+        );
+        router.record_result("acme", "search", false, 100);
+        assert_eq!(router.node_state("acme", "search"), Some(NodeState::Open));
     }
 
     #[test]

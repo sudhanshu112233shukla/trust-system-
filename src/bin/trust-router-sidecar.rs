@@ -13,13 +13,12 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
+use trust_router::sidecar_config::{DEFAULT_TENANT, SidecarConfig};
 use trust_router::{
     AuditEvent, Edge, NodeState, RouteDecision, Router as TrustRouter, append_events_jsonl,
 };
 
-const DEFAULT_API_KEY: &str = "trust-router-demo-key";
-const DEFAULT_ADDRESS: &str = "127.0.0.1:7878";
-const TENANT: &str = "yc-demo";
+const TENANT: &str = DEFAULT_TENANT;
 const KNOWN_NODES: [&str; 5] = [
     "start",
     "primary_search",
@@ -32,19 +31,17 @@ const KNOWN_NODES: [&str; 5] = [
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_target(false).init();
 
-    let address = sidecar_address();
-    let audit_path = std::env::args()
-        .nth(2)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("sidecar-audit.jsonl"));
-    let api_key = std::env::var("TRUST_ROUTER_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.into());
-    let router = build_demo_router();
+    let args = std::env::args().collect::<Vec<_>>();
+    let config = SidecarConfig::load(&args)?;
+    let router = build_demo_router(&config)?;
+    let recovery_loop =
+        router.spawn_recovery_loop(config.health_policy.cooldown, config.recovery_scan_interval);
     let otel = OtelMetrics::from_env(&router);
     let metrics = Arc::new(Mutex::new(Metrics::default()));
     let state = AppState {
         router,
-        audit_path,
-        api_key,
+        audit_path: config.audit_path.clone(),
+        api_key: config.api_key.clone(),
         metrics,
         otel,
     };
@@ -60,33 +57,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_state(Arc::new(state));
 
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
     let local_addr = listener.local_addr()?;
     info!(%local_addr, "Trust Router sidecar listening");
     println!("Trust Router sidecar listening on http://{local_addr}");
     println!("Protected endpoints require X-API-Key.");
-    println!("Audit file: {}", app_state_audit_hint());
+    println!("Audit file: {}", config.audit_path.display());
     println!("Try: http://{local_addr}/route?tenant=yc-demo&start=start&goal=done");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    recovery_loop.abort();
+    let _ = recovery_loop.await;
 
     Ok(())
-}
-
-fn sidecar_address() -> String {
-    std::env::args().nth(1).unwrap_or_else(|| {
-        std::env::var("PORT")
-            .map(|port| format!("0.0.0.0:{port}"))
-            .unwrap_or_else(|_| DEFAULT_ADDRESS.to_string())
-    })
-}
-
-fn app_state_audit_hint() -> String {
-    std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "sidecar-audit.jsonl".to_string())
 }
 
 async fn shutdown_signal() {
@@ -716,9 +701,11 @@ fn penalty_path_available(router: &TrustRouter, tenant: &str) -> bool {
     })
 }
 
-fn build_demo_router() -> TrustRouter {
+fn build_demo_router(config: &SidecarConfig) -> Result<TrustRouter, trust_router::RouterError> {
     let router = TrustRouter::new();
     router.add_tenant(TENANT);
+    router.try_set_cost_model(TENANT, config.cost_model)?;
+    router.try_set_health_policy(TENANT, config.health_policy)?;
     router.add_edge(
         TENANT,
         Edge::new("start", "primary_search").with_costs(1.0, 0.001, 120, 0.1),
@@ -739,5 +726,5 @@ fn build_demo_router() -> TrustRouter {
         TENANT,
         Edge::new("summarize", "done").with_costs(1.0, 0.001, 120, 0.1),
     );
-    router
+    Ok(router)
 }

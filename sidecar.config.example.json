@@ -1,0 +1,28 @@
+{
+  "mode": "development",
+  "bind_address": "127.0.0.1:7878",
+  "audit_path": "sidecar-audit.jsonl",
+  "api_key_file": "./secrets/trust-router-api-key",
+  "allowed_tenants": ["yc-demo"],
+  "rate_limit": {
+    "capacity": 120,
+    "refill_per_second": 60
+  },
+  "cost": {
+    "w_dollar": 0.4,
+    "w_latency": 0.3,
+    "w_risk": 0.2,
+    "w_base": 0.1,
+    "max_dollar": 0.01,
+    "max_latency_ms": 1000,
+    "max_base": 10.0
+  },
+  "health": {
+    "open_threshold": 5,
+    "degraded_threshold": 2,
+    "half_open_success_needed": 3,
+    "degraded_success_needed": 2,
+    "cooldown_ms": 30000
+  },
+  "recovery_scan_interval_ms": 1000
+}
