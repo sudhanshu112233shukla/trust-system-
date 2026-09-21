@@ -59,9 +59,12 @@ fn sidecar_metrics_counts_routes_reroutes_escalations_and_health() {
 
     let metrics = http_get(address, "/metrics");
     assert_eq!(json_u64(&metrics, "total_routes"), 4);
-    assert_eq!(json_u64(&metrics, "total_reroutes"), 3);
+    assert_eq!(json_u64(&metrics, "total_successful_routes"), 3);
+    assert_eq!(json_u64(&metrics, "total_reroutes"), 1);
     assert_eq!(json_u64(&metrics, "total_escalations"), 1);
     assert_eq!(json_u64(&metrics, "llm_calls_avoided"), 3);
+    assert_eq!(json_u64(&metrics, "cache_hits"), 1);
+    assert_eq!(json_u64(&metrics, "cache_misses"), 2);
     assert!(metrics.contains("\"escalation_rate\":0.25"));
     assert!(metrics.contains("\"primary_search\":\"Open\""));
     assert!(metrics.contains("\"fallback_search\":\"Open\""));

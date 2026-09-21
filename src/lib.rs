@@ -2,12 +2,14 @@ pub mod escalation;
 pub mod health_monitor;
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+
+use serde_json::json;
 
 pub type TenantId = String;
 pub type NodeId = String;
@@ -17,6 +19,9 @@ pub const DEGRADED_THRESHOLD: u32 = 2;
 pub const HALF_OPEN_SUCCESS_NEEDED: u32 = 3;
 pub const DEGRADED_SUCCESS_NEEDED: u32 = 2;
 pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+pub const LATENCY_SAMPLE_LIMIT: usize = 128;
+pub const ROUTE_CACHE_LIMIT: usize = 1024;
+pub const AUDIT_EVENT_MEMORY_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostWeights {
@@ -107,6 +112,17 @@ impl Edge {
         self
     }
 
+    pub fn is_valid(&self) -> bool {
+        !self.from.is_empty()
+            && !self.to.is_empty()
+            && self.base_cost.is_finite()
+            && self.dollar_cost.is_finite()
+            && self.risk.is_finite()
+            && self.base_cost >= 0.0
+            && self.dollar_cost >= 0.0
+            && self.risk >= 0.0
+    }
+
     pub fn weight(&self, cost_model: TenantCostModel) -> f64 {
         let ceilings = cost_model.ceilings;
         let weights = cost_model.weights;
@@ -138,6 +154,7 @@ pub struct HealthTracker {
     pub p99_latency_ms: u64,
     pub success_rate: f64,
     pub opened_at: Option<Instant>,
+    latency_samples: VecDeque<u64>,
 }
 
 impl Default for HealthTracker {
@@ -149,6 +166,7 @@ impl Default for HealthTracker {
             p99_latency_ms: 0,
             success_rate: 1.0,
             opened_at: None,
+            latency_samples: VecDeque::new(),
         }
     }
 }
@@ -156,7 +174,7 @@ impl Default for HealthTracker {
 impl HealthTracker {
     pub fn record_result(&mut self, success: bool, latency_ms: u64) -> bool {
         let previous_state = self.state;
-        self.p99_latency_ms = latency_ms;
+        self.record_latency_sample(latency_ms);
 
         if success {
             self.consecutive_successes += 1;
@@ -188,6 +206,17 @@ impl HealthTracker {
         }
 
         previous_state != self.state
+    }
+
+    fn record_latency_sample(&mut self, latency_ms: u64) {
+        if self.latency_samples.len() == LATENCY_SAMPLE_LIMIT {
+            self.latency_samples.pop_front();
+        }
+        self.latency_samples.push_back(latency_ms);
+        let mut samples: Vec<_> = self.latency_samples.iter().copied().collect();
+        samples.sort_unstable();
+        let index = ((samples.len().saturating_sub(1)) as f64 * 0.99).round() as usize;
+        self.p99_latency_ms = samples.get(index).copied().unwrap_or(latency_ms);
     }
 
     pub fn transition_to_half_open_if_ready(&mut self, cooldown: Duration, now: Instant) -> bool {
@@ -284,7 +313,7 @@ pub enum AuditEvent {
 
 impl AuditEvent {
     pub fn to_json_line(&self) -> String {
-        match self {
+        let value = match self {
             AuditEvent::Reroute {
                 tenant_id,
                 start,
@@ -292,41 +321,43 @@ impl AuditEvent {
                 path,
                 total_cost,
                 cache_hit,
-            } => format!(
-                "{{\"event\":\"reroute\",\"tenant_id\":\"{}\",\"start\":\"{}\",\"goal\":\"{}\",\"path\":{},\"total_cost\":{},\"cache_hit\":{}}}",
-                json_escape(tenant_id),
-                json_escape(start),
-                json_escape(goal),
-                json_string_array(path),
-                total_cost,
-                cache_hit
-            ),
-            AuditEvent::ExplicitEscalation(context) => format!(
-                "{{\"event\":\"explicit_escalation\",\"tenant_id\":\"{}\",\"start\":\"{}\",\"goal\":\"{}\",\"reason\":\"{:?}\",\"failed_or_blocked_nodes\":{}}}",
-                json_escape(&context.tenant_id),
-                json_escape(&context.start),
-                json_escape(&context.goal),
-                context.reason,
-                json_string_array(&context.failed_or_blocked_nodes)
-            ),
+            } => json!({
+                "event": "reroute",
+                "tenant_id": tenant_id,
+                "start": start,
+                "goal": goal,
+                "path": path,
+                "total_cost": total_cost,
+                "cache_hit": cache_hit,
+            }),
+            AuditEvent::ExplicitEscalation(context) => json!({
+                "event": "explicit_escalation",
+                "tenant_id": &context.tenant_id,
+                "start": &context.start,
+                "goal": &context.goal,
+                "reason": format!("{:?}", context.reason),
+                "failed_or_blocked_nodes": &context.failed_or_blocked_nodes,
+            }),
             AuditEvent::HealthChanged {
                 tenant_id,
                 node_id,
                 state,
                 state_changed,
-            } => format!(
-                "{{\"event\":\"health_changed\",\"tenant_id\":\"{}\",\"node_id\":\"{}\",\"state\":\"{:?}\",\"state_changed\":{}}}",
-                json_escape(tenant_id),
-                json_escape(node_id),
-                state,
-                state_changed
-            ),
-            AuditEvent::RecoveryProbeOpened { tenant_id, node_id } => format!(
-                "{{\"event\":\"recovery_probe_opened\",\"tenant_id\":\"{}\",\"node_id\":\"{}\"}}",
-                json_escape(tenant_id),
-                json_escape(node_id)
-            ),
-        }
+            } => json!({
+                "event": "health_changed",
+                "tenant_id": tenant_id,
+                "node_id": node_id,
+                "state": format!("{:?}", state),
+                "state_changed": state_changed,
+            }),
+            AuditEvent::RecoveryProbeOpened { tenant_id, node_id } => json!({
+                "event": "recovery_probe_opened",
+                "tenant_id": tenant_id,
+                "node_id": node_id,
+            }),
+        };
+
+        serde_json::to_string(&value).expect("audit events serialize to JSON")
     }
 }
 
@@ -389,7 +420,7 @@ impl Router {
             tenant.invalidate_for_node(&node_id);
         }
 
-        state.events.push(AuditEvent::HealthChanged {
+        state.push_event(AuditEvent::HealthChanged {
             tenant_id,
             node_id,
             state: node_state,
@@ -417,9 +448,7 @@ impl Router {
         }
 
         tenant.invalidate_for_node(&node_id);
-        state
-            .events
-            .push(AuditEvent::RecoveryProbeOpened { tenant_id, node_id });
+        state.push_event(AuditEvent::RecoveryProbeOpened { tenant_id, node_id });
         true
     }
 
@@ -459,7 +488,7 @@ impl Router {
             if let Some(tenant) = state.tenants.get_mut(tenant_id) {
                 tenant.invalidate_for_node(node_id);
             }
-            state.events.push(AuditEvent::RecoveryProbeOpened {
+            state.push_event(AuditEvent::RecoveryProbeOpened {
                 tenant_id: tenant_id.clone(),
                 node_id: node_id.clone(),
             });
@@ -494,13 +523,13 @@ impl Router {
             goal: goal.clone(),
         };
 
-        if let Some(cached) = tenant.cache.get(&cache_key).cloned() {
+        if let Some(cached) = tenant.get_cached(&cache_key) {
             let route = Route {
                 nodes: cached.path,
                 total_cost: cached.weight,
                 cache_hit: true,
             };
-            state.events.push(AuditEvent::Reroute {
+            state.push_event(AuditEvent::Reroute {
                 tenant_id,
                 start,
                 goal,
@@ -516,7 +545,7 @@ impl Router {
             .shortest_path(&tenant.health, tenant.cost_model, &start, &goal)
         {
             Some(route) => {
-                tenant.cache.insert(
+                tenant.insert_cache(
                     cache_key,
                     CachedPath {
                         path: route.nodes.clone(),
@@ -524,7 +553,7 @@ impl Router {
                         touched_nodes: route.nodes.iter().cloned().collect(),
                     },
                 );
-                state.events.push(AuditEvent::Reroute {
+                state.push_event(AuditEvent::Reroute {
                     tenant_id,
                     start,
                     goal,
@@ -548,11 +577,11 @@ impl Router {
     }
 
     pub fn events(&self) -> Vec<AuditEvent> {
-        self.read_state().events.clone()
+        self.read_state().events.iter().cloned().collect()
     }
 
     pub fn last_audit_event(&self) -> Option<AuditEvent> {
-        self.read_state().events.last().cloned()
+        self.read_state().events.back().cloned()
     }
 
     pub fn node_state(
@@ -585,13 +614,19 @@ impl Router {
 #[derive(Debug, Default)]
 struct RouterState {
     tenants: HashMap<TenantId, TenantState>,
-    events: Vec<AuditEvent>,
+    events: VecDeque<AuditEvent>,
 }
 
 impl RouterState {
+    fn push_event(&mut self, event: AuditEvent) {
+        if self.events.len() == AUDIT_EVENT_MEMORY_LIMIT {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
     fn escalate(&mut self, context: EscalationContext) -> RouteDecision {
-        self.events
-            .push(AuditEvent::ExplicitEscalation(context.clone()));
+        self.push_event(AuditEvent::ExplicitEscalation(context.clone()));
         RouteDecision::Escalate(context)
     }
 }
@@ -601,17 +636,38 @@ struct TenantState {
     graph: ToolGraph,
     health: HashMap<NodeId, HealthTracker>,
     cache: HashMap<RouteKey, CachedPath>,
+    cache_order: VecDeque<RouteKey>,
     cost_model: TenantCostModel,
 }
 
 impl TenantState {
     fn invalidate_all_cache(&mut self) {
         self.cache.clear();
+        self.cache_order.clear();
     }
 
     fn invalidate_for_node(&mut self, node: &str) {
         self.cache
             .retain(|_, cached| !cached.touched_nodes.contains(node));
+        self.cache_order.retain(|key| self.cache.contains_key(key));
+    }
+
+    fn get_cached(&mut self, key: &RouteKey) -> Option<CachedPath> {
+        let cached = self.cache.get(key)?.clone();
+        self.cache_order.retain(|existing| existing != key);
+        self.cache_order.push_back(key.clone());
+        Some(cached)
+    }
+
+    fn insert_cache(&mut self, key: RouteKey, cached: CachedPath) {
+        if !self.cache.contains_key(&key) && self.cache.len() == ROUTE_CACHE_LIMIT {
+            if let Some(evicted) = self.cache_order.pop_front() {
+                self.cache.remove(&evicted);
+            }
+        }
+        self.cache_order.retain(|existing| existing != &key);
+        self.cache_order.push_back(key.clone());
+        self.cache.insert(key, cached);
     }
 
     fn blocked_nodes(&self) -> Vec<NodeId> {
@@ -688,6 +744,10 @@ impl ToolGraph {
                     .get(&edge.to)
                     .map(HealthTracker::penalty)
                     .unwrap_or(0.0);
+                if !edge.is_valid() {
+                    continue;
+                }
+
                 let edge_cost = edge.weight(cost_model) + health_penalty;
                 if edge_cost.is_infinite() || edge_cost.is_nan() {
                     continue;
@@ -718,6 +778,7 @@ fn normalize(value: f64, ceiling: f64) -> f64 {
     (value / ceiling).clamp(0.0, 1.0)
 }
 
+#[allow(dead_code)]
 fn json_string_array(values: &[String]) -> String {
     let items: Vec<_> = values
         .iter()
@@ -726,6 +787,7 @@ fn json_string_array(values: &[String]) -> String {
     format!("[{}]", items.join(","))
 }
 
+#[allow(dead_code)]
 fn json_escape(value: &str) -> String {
     value
         .chars()
@@ -1069,6 +1131,86 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AuditEvent::RecoveryProbeOpened { .. }))
         );
+    }
+
+    #[test]
+    fn latency_p99_uses_a_bounded_rolling_sample() {
+        let mut tracker = HealthTracker::default();
+
+        for latency_ms in 1..=200 {
+            tracker.record_result(true, latency_ms);
+        }
+        let p99_before_latest_sample = tracker.p99_latency_ms;
+        tracker.record_result(true, 1);
+
+        assert_eq!(tracker.latency_samples.len(), LATENCY_SAMPLE_LIMIT);
+        assert!(p99_before_latest_sample >= 198);
+        assert!(tracker.p99_latency_ms >= 198);
+    }
+
+    #[test]
+    fn half_open_failure_reopens_the_circuit() {
+        let router = sample_router();
+        open_node(&router, "search");
+        assert!(router.force_half_open("acme", "search"));
+
+        router.record_result("acme", "search", false, 1_000);
+
+        assert_eq!(router.node_state("acme", "search"), Some(NodeState::Open));
+    }
+
+    #[test]
+    fn start_equal_to_goal_is_a_zero_cost_route() {
+        let router = sample_router();
+
+        let RouteDecision::Routed(route) = router.route("acme", "start", "start") else {
+            panic!("expected a route");
+        };
+
+        assert_eq!(route.nodes, vec!["start"]);
+        assert_eq!(route.total_cost, 0.0);
+        assert!(!route.cache_hit);
+    }
+
+    #[test]
+    fn route_cache_has_a_fixed_capacity() {
+        let router = Router::new();
+        router.add_tenant("bounded-cache");
+
+        for index in 0..(ROUTE_CACHE_LIMIT + 8) {
+            router.add_edge(
+                "bounded-cache",
+                Edge::new(format!("start_{index}"), format!("goal_{index}"))
+                    .with_costs(1.0, 0.001, 10, 0.1),
+            );
+        }
+
+        for index in 0..(ROUTE_CACHE_LIMIT + 8) {
+            assert!(matches!(
+                router.route(
+                    "bounded-cache",
+                    format!("start_{index}"),
+                    format!("goal_{index}")
+                ),
+                RouteDecision::Routed(_)
+            ));
+        }
+
+        let state = router.read_state();
+        let tenant = state.tenants.get("bounded-cache").expect("tenant exists");
+        assert_eq!(tenant.cache.len(), ROUTE_CACHE_LIMIT);
+        assert_eq!(tenant.cache_order.len(), ROUTE_CACHE_LIMIT);
+    }
+
+    #[test]
+    fn audit_event_history_has_a_fixed_capacity() {
+        let router = sample_router();
+
+        for _ in 0..(AUDIT_EVENT_MEMORY_LIMIT + 8) {
+            let _ = router.route("acme", "start", "done");
+        }
+
+        assert_eq!(router.events().len(), AUDIT_EVENT_MEMORY_LIMIT);
     }
 
     fn assert_routed_cache_state(router: &Router, expected_cache_hit: bool) {

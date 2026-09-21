@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -180,14 +180,15 @@ fn handle_route(state: &AppState, query: RouteQuery) -> Result<Json<RouteRespons
 
     let response = RouteResponse::from_decision(decision.clone());
     let mut metrics = state.metrics.lock().expect("metrics lock poisoned");
-    let false_escalation = metrics.record_route(&query.tenant, &decision, elapsed, &state.router);
+    let route_metrics = metrics.record_route(&query.tenant, &decision, elapsed, &state.router);
     drop(metrics);
     if let Some(otel) = &state.otel {
         otel.record_route(
             &query.tenant,
             &decision,
             elapsed,
-            false_escalation,
+            route_metrics.false_escalation,
+            route_metrics.rerouted,
             &state.router,
         );
     }
@@ -363,14 +364,19 @@ impl RouteResponse {
     }
 }
 
+const LATENCY_SAMPLE_LIMIT: usize = 4096;
+
 #[derive(Debug, Default)]
 struct Metrics {
     total_routes: u64,
+    total_successful_routes: u64,
     total_reroutes: u64,
     total_escalations: u64,
     false_escalations: u64,
+    cache_hits: u64,
+    cache_misses: u64,
     per_tenant: HashMap<String, TenantMetrics>,
-    route_latencies: Vec<Duration>,
+    route_latencies: BoundedLatencies,
 }
 
 impl Metrics {
@@ -380,34 +386,51 @@ impl Metrics {
         decision: &RouteDecision,
         latency: Duration,
         router: &TrustRouter,
-    ) -> bool {
+    ) -> RouteMetricOutcome {
         self.total_routes += 1;
+        self.route_latencies.push(latency);
         let tenant_metrics = self.per_tenant.entry(tenant.to_string()).or_default();
         tenant_metrics.total_routes += 1;
-        let mut false_escalation = false;
+        tenant_metrics.route_latencies.push(latency);
+
+        let mut outcome = RouteMetricOutcome::default();
         match decision {
-            RouteDecision::Routed(_) => {
-                self.total_reroutes += 1;
-                tenant_metrics.total_reroutes += 1;
+            RouteDecision::Routed(route) => {
+                self.total_successful_routes += 1;
+                tenant_metrics.total_successful_routes += 1;
+                if route.cache_hit {
+                    self.cache_hits += 1;
+                    tenant_metrics.cache_hits += 1;
+                } else {
+                    self.cache_misses += 1;
+                    tenant_metrics.cache_misses += 1;
+                }
+
+                let path_changed = tenant_metrics
+                    .last_successful_path
+                    .as_ref()
+                    .is_some_and(|previous| previous != &route.nodes);
+                if path_changed && !route.cache_hit {
+                    self.total_reroutes += 1;
+                    tenant_metrics.total_reroutes += 1;
+                    outcome.rerouted = true;
+                }
+                tenant_metrics.last_successful_path = Some(route.nodes.clone());
             }
             RouteDecision::Escalate(_) => {
                 self.total_escalations += 1;
                 tenant_metrics.total_escalations += 1;
-                false_escalation = penalty_path_available(router, tenant);
-                if false_escalation {
+                outcome.false_escalation = penalty_path_available(router, tenant);
+                if outcome.false_escalation {
                     self.false_escalations += 1;
                     tenant_metrics.false_escalations += 1;
                 }
             }
         }
-        self.route_latencies.push(latency);
-        tenant_metrics.route_latencies.push(latency);
-        false_escalation
+        outcome
     }
 
     fn to_response(&self, router: &TrustRouter) -> MetricsResponse {
-        let mut sorted = self.route_latencies.clone();
-        sorted.sort_unstable();
         let tenants = self
             .per_tenant
             .iter()
@@ -415,55 +438,95 @@ impl Metrics {
             .collect::<HashMap<_, _>>();
         MetricsResponse {
             total_routes: self.total_routes,
+            total_successful_routes: self.total_successful_routes,
             total_reroutes: self.total_reroutes,
             total_escalations: self.total_escalations,
             escalation_rate: rate(self.total_escalations, self.total_routes),
             llm_calls_avoided: self.total_routes.saturating_sub(self.total_escalations),
             false_escalations: self.false_escalations,
             false_escalation_rate: rate(self.false_escalations, self.total_routes),
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+            cache_hit_ratio: rate(self.cache_hits, self.cache_hits + self.cache_misses),
             node_health: node_health(router, TENANT),
-            route_latency_us: LatencyPercentiles::from_sorted(&sorted),
+            route_latency_us: self.route_latencies.percentiles(),
             tenants,
         }
     }
 }
 
 #[derive(Debug, Default)]
+struct RouteMetricOutcome {
+    rerouted: bool,
+    false_escalation: bool,
+}
+
+#[derive(Debug, Default)]
 struct TenantMetrics {
     total_routes: u64,
+    total_successful_routes: u64,
     total_reroutes: u64,
     total_escalations: u64,
     false_escalations: u64,
-    route_latencies: Vec<Duration>,
+    cache_hits: u64,
+    cache_misses: u64,
+    last_successful_path: Option<Vec<String>>,
+    route_latencies: BoundedLatencies,
 }
 
 impl TenantMetrics {
     fn to_response(&self, router: &TrustRouter, tenant: &str) -> TenantMetricsResponse {
-        let mut sorted = self.route_latencies.clone();
-        sorted.sort_unstable();
         TenantMetricsResponse {
             total_routes: self.total_routes,
+            total_successful_routes: self.total_successful_routes,
             total_reroutes: self.total_reroutes,
             total_escalations: self.total_escalations,
             escalation_rate: rate(self.total_escalations, self.total_routes),
             llm_calls_avoided: self.total_routes.saturating_sub(self.total_escalations),
             false_escalations: self.false_escalations,
             false_escalation_rate: rate(self.false_escalations, self.total_routes),
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+            cache_hit_ratio: rate(self.cache_hits, self.cache_hits + self.cache_misses),
             node_health: node_health(router, tenant),
-            route_latency_us: LatencyPercentiles::from_sorted(&sorted),
+            route_latency_us: self.route_latencies.percentiles(),
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BoundedLatencies {
+    values: VecDeque<Duration>,
+}
+
+impl BoundedLatencies {
+    fn push(&mut self, value: Duration) {
+        if self.values.len() == LATENCY_SAMPLE_LIMIT {
+            self.values.pop_front();
+        }
+        self.values.push_back(value);
+    }
+
+    fn percentiles(&self) -> LatencyPercentiles {
+        let mut sorted = self.values.iter().copied().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        LatencyPercentiles::from_sorted(&sorted)
     }
 }
 
 #[derive(Debug, Serialize)]
 struct MetricsResponse {
     total_routes: u64,
+    total_successful_routes: u64,
     total_reroutes: u64,
     total_escalations: u64,
     escalation_rate: f64,
     llm_calls_avoided: u64,
     false_escalations: u64,
     false_escalation_rate: f64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_hit_ratio: f64,
     node_health: HashMap<String, String>,
     route_latency_us: LatencyPercentiles,
     tenants: HashMap<String, TenantMetricsResponse>,
@@ -472,12 +535,16 @@ struct MetricsResponse {
 #[derive(Debug, Serialize)]
 struct TenantMetricsResponse {
     total_routes: u64,
+    total_successful_routes: u64,
     total_reroutes: u64,
     total_escalations: u64,
     escalation_rate: f64,
     llm_calls_avoided: u64,
     false_escalations: u64,
     false_escalation_rate: f64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_hit_ratio: f64,
     node_health: HashMap<String, String>,
     route_latency_us: LatencyPercentiles,
 }
@@ -553,6 +620,7 @@ impl OtelMetrics {
         decision: &RouteDecision,
         latency: Duration,
         false_escalation: bool,
+        rerouted: bool,
         router: &TrustRouter,
     ) {
         let attrs = [KeyValue::new("tenant", tenant.to_string())];
@@ -561,7 +629,9 @@ impl OtelMetrics {
             .record(latency.as_micros() as f64, &attrs);
         match decision {
             RouteDecision::Routed(_) => {
-                self.reroute_total.add(1, &attrs);
+                if rerouted {
+                    self.reroute_total.add(1, &attrs);
+                }
                 self.llm_calls_avoided_total.add(1, &attrs);
             }
             RouteDecision::Escalate(_) => {
