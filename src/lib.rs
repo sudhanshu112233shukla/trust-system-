@@ -1,6 +1,7 @@
 pub mod escalation;
 pub mod health_monitor;
 pub mod sidecar_config;
+pub mod sidecar_security;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
