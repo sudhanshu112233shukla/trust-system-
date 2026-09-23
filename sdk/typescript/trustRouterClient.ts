@@ -1,4 +1,4 @@
-﻿export type RouteDecision =
+export type RouteDecision =
   | {
       decision: "routed";
       path: string[];
@@ -9,6 +9,22 @@
       decision: "escalate";
       reason: string;
       failed_or_blocked_nodes: string[];
+    };
+
+export type PlanDecision =
+  | {
+      decision: "execute";
+      schema_version: number;
+      path: string[];
+      total_cost: number;
+      cache_hit: boolean;
+      steps: string[];
+    }
+  | {
+      decision: "recover";
+      reason: string;
+      failed_or_blocked_nodes: string[];
+      recovery_steps: string[];
     };
 
 export type ResultResponse = {
@@ -43,6 +59,18 @@ export class TrustRouterClient {
     });
 
     return this.request<RouteDecision>(`/route?${params.toString()}`, {
+      method: "GET",
+    });
+  }
+
+  async plan(start: string, goal: string): Promise<PlanDecision> {
+    const params = new URLSearchParams({
+      tenant: this.tenant,
+      start,
+      goal,
+    });
+
+    return this.request<PlanDecision>(`/plan?${params.toString()}`, {
       method: "GET",
     });
   }

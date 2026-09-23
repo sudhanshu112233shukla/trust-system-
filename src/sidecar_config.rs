@@ -75,7 +75,7 @@ impl Default for RawConfig {
             audit_path: None,
             api_key: None,
             api_key_file: None,
-            allowed_tenants: vec![DEFAULT_TENANT.to_string()],
+            allowed_tenants: Vec::new(),
             rate_limit: RateLimitConfig::default(),
             cost: RawCostModel::default(),
             health: RawHealthPolicy::default(),
@@ -324,6 +324,9 @@ impl SidecarConfig {
                 "recovery_scan_interval_ms must be greater than zero".into(),
             ));
         }
+        if raw.allowed_tenants.is_empty() && raw.mode == DeploymentMode::Development {
+            raw.allowed_tenants = vec![DEFAULT_TENANT.to_string()];
+        }
         if raw.allowed_tenants.is_empty() {
             return Err(ConfigError::Invalid(
                 "allowed_tenants cannot be empty".into(),
@@ -476,6 +479,22 @@ mod tests {
         let error = SidecarConfig::from_raw(raw, &["sidecar".to_string()])
             .expect_err("demo API key must not be accepted in production");
         assert!(error.to_string().contains("production API key"));
+    }
+
+    #[test]
+    fn production_requires_an_explicit_tenant_allow_list() {
+        let raw = RawConfig {
+            mode: DeploymentMode::Production,
+            api_key: Some("a-32-character-production-secret!!".to_string()),
+            ..RawConfig::default()
+        };
+        let error = SidecarConfig::from_raw(raw, &["sidecar".to_string()])
+            .expect_err("production requires an explicit tenant allow-list");
+        assert!(
+            error
+                .to_string()
+                .contains("allowed_tenants cannot be empty")
+        );
     }
 
     #[test]

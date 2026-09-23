@@ -1,19 +1,22 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
+use trust_router::planner::{PlanOutcome, Planner, PlanningRequest};
 use trust_router::sidecar_config::{DEFAULT_TENANT, SidecarConfig};
+use trust_router::sidecar_security::TokenBucket;
 use trust_router::{
     AuditEvent, Edge, NodeState, RouteDecision, Router as TrustRouter, append_events_jsonl,
 };
@@ -42,6 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router,
         audit_path: config.audit_path.clone(),
         api_key: config.api_key.clone(),
+        allowed_tenants: config.allowed_tenants.iter().cloned().collect(),
+        rate_limiter: Arc::new(Mutex::new(TokenBucket::new(&config.rate_limit))),
+        next_request_id: AtomicU64::new(1),
         metrics,
         otel,
     };
@@ -50,11 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .route("/route", get(route_handler).post(route_handler))
-        .route("/result", get(result_handler).post(result_handler))
-        .route(
-            "/force-half-open",
-            get(force_half_open_handler).post(force_half_open_handler),
-        )
+        .route("/plan", get(plan_handler))
+        .route("/result", post(result_handler))
+        .route("/force-half-open", post(force_half_open_handler))
         .with_state(Arc::new(state));
 
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
@@ -81,13 +85,24 @@ async fn shutdown_signal() {
     info!("shutdown signal received");
 }
 
-#[derive(Clone)]
 struct AppState {
     router: TrustRouter,
     audit_path: PathBuf,
     api_key: String,
+    allowed_tenants: HashSet<String>,
+    rate_limiter: Arc<Mutex<TokenBucket>>,
+    next_request_id: AtomicU64,
     metrics: Arc<Mutex<Metrics>>,
     otel: Option<Arc<OtelMetrics>>,
+}
+
+impl AppState {
+    fn request_id(&self) -> String {
+        format!(
+            "tr-{:016x}",
+            self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        )
+    }
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -95,12 +110,16 @@ async fn healthz() -> Json<HealthResponse> {
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match require_api_key(&headers, &state.api_key) {
+    let request_id = state.request_id();
+    match authorize_request(&state, &headers, None) {
         Ok(()) => {
             let metrics = state.metrics.lock().expect("metrics lock poisoned");
-            Json(metrics.to_response(&state.router)).into_response()
+            response_with_request_id(
+                Json(metrics.to_response(&state.router)).into_response(),
+                &request_id,
+            )
         }
-        Err(error) => error.into_response(),
+        Err(error) => error.into_response(&request_id),
     }
 }
 
@@ -109,9 +128,34 @@ async fn route_handler(
     headers: HeaderMap,
     Query(query): Query<RouteQuery>,
 ) -> Response {
-    match require_api_key(&headers, &state.api_key).and_then(|_| query.validate()) {
-        Ok(()) => handle_route(&state, query).into_response(),
-        Err(error) => error.into_response(),
+    let request_id = state.request_id();
+    match query
+        .validate()
+        .and_then(|_| authorize_request(&state, &headers, Some(&query.tenant)))
+    {
+        Ok(()) => match handle_route(&state, query) {
+            Ok(response) => response_with_request_id(response.into_response(), &request_id),
+            Err(error) => error.into_response(&request_id),
+        },
+        Err(error) => error.into_response(&request_id),
+    }
+}
+
+async fn plan_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<RouteQuery>,
+) -> Response {
+    let request_id = state.request_id();
+    match query
+        .validate()
+        .and_then(|_| authorize_request(&state, &headers, Some(&query.tenant)))
+    {
+        Ok(()) => match handle_plan(&state, query) {
+            Ok(response) => response_with_request_id(response.into_response(), &request_id),
+            Err(error) => error.into_response(&request_id),
+        },
+        Err(error) => error.into_response(&request_id),
     }
 }
 
@@ -120,7 +164,11 @@ async fn result_handler(
     headers: HeaderMap,
     Query(query): Query<ResultQuery>,
 ) -> Response {
-    match require_api_key(&headers, &state.api_key).and_then(|_| query.validate()) {
+    let request_id = state.request_id();
+    match query
+        .validate()
+        .and_then(|_| authorize_request(&state, &headers, Some(&query.tenant)))
+    {
         Ok(()) => {
             state
                 .router
@@ -128,9 +176,9 @@ async fn result_handler(
             if let Some(otel) = &state.otel {
                 otel.record_node_health(&query.tenant, &state.router);
             }
-            Json(OkResponse { ok: true }).into_response()
+            response_with_request_id(Json(OkResponse { ok: true }).into_response(), &request_id)
         }
-        Err(error) => error.into_response(),
+        Err(error) => error.into_response(&request_id),
     }
 }
 
@@ -139,17 +187,22 @@ async fn force_half_open_handler(
     headers: HeaderMap,
     Query(query): Query<ForceHalfOpenQuery>,
 ) -> Response {
-    match require_api_key(&headers, &state.api_key).and_then(|_| query.validate()) {
+    let request_id = state.request_id();
+    match query
+        .validate()
+        .and_then(|_| authorize_request(&state, &headers, Some(&query.tenant)))
+    {
         Ok(()) => {
             let changed = state.router.force_half_open(&query.tenant, &query.node);
-            if changed {
-                if let Some(otel) = &state.otel {
-                    otel.record_node_health(&query.tenant, &state.router);
-                }
+            if changed && let Some(otel) = &state.otel {
+                otel.record_node_health(&query.tenant, &state.router);
             }
-            Json(ForceHalfOpenResponse { changed }).into_response()
+            response_with_request_id(
+                Json(ForceHalfOpenResponse { changed }).into_response(),
+                &request_id,
+            )
         }
-        Err(error) => error.into_response(),
+        Err(error) => error.into_response(&request_id),
     }
 }
 
@@ -178,6 +231,28 @@ fn handle_route(state: &AppState, query: RouteQuery) -> Result<Json<RouteRespons
         );
     }
     Ok(Json(response))
+}
+
+fn handle_plan(state: &AppState, query: RouteQuery) -> Result<Json<PlanResponse>, SidecarError> {
+    let started = Instant::now();
+    let planner = Planner::new(state.router.clone());
+    let outcome = planner
+        .plan(PlanningRequest::new(
+            &query.tenant,
+            &query.start,
+            &query.goal,
+        ))
+        .map_err(|error| SidecarError::BadRequest(error.to_string()))?;
+    let event = state
+        .router
+        .last_audit_event()
+        .ok_or_else(|| SidecarError::Internal("planner did not create an audit event".into()))?;
+    persist_before_response(&state.audit_path, event)?;
+    let elapsed = started.elapsed();
+    let mut metrics = state.metrics.lock().expect("metrics lock poisoned");
+    metrics.record_plan(&outcome, elapsed);
+    drop(metrics);
+    Ok(Json(PlanResponse::from_outcome(outcome)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,24 +325,98 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), SidecarError> {
 enum SidecarError {
     BadRequest(String),
     Unauthorized,
+    Forbidden,
+    RateLimited { retry_after_secs: u64 },
     Internal(String),
 }
 
-impl IntoResponse for SidecarError {
-    fn into_response(self) -> Response {
-        let (status, message) = match self {
-            SidecarError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+impl SidecarError {
+    fn into_response(self, request_id: &str) -> Response {
+        let (status, code, message, retry_after) = match self {
+            SidecarError::BadRequest(message) => {
+                (StatusCode::BAD_REQUEST, "invalid_request", message, None)
+            }
             SidecarError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
+                "unauthorized",
                 "missing or invalid API key".into(),
+                None,
+            ),
+            SidecarError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "tenant_not_authorized",
+                "API key is not authorized for this tenant".into(),
+                None,
+            ),
+            SidecarError::RateLimited { retry_after_secs } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "request rate limit exceeded".into(),
+                Some(retry_after_secs),
             ),
             SidecarError::Internal(message) => {
-                error!(%message, "sidecar internal error");
-                (StatusCode::INTERNAL_SERVER_ERROR, message)
+                error!(%request_id, %message, "sidecar internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "internal service error".into(),
+                    None,
+                )
             }
         };
-        (status, Json(ErrorResponse { error: message })).into_response()
+        let mut response = (
+            status,
+            Json(ErrorResponse {
+                error: ErrorBody {
+                    code: code.to_string(),
+                    message,
+                    request_id: request_id.to_string(),
+                },
+            }),
+        )
+            .into_response();
+        if let Some(seconds) = retry_after {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&seconds.to_string()).expect("retry-after is numeric"),
+            );
+        }
+        response_with_request_id(response, request_id)
     }
+}
+
+fn authorize_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant: Option<&str>,
+) -> Result<(), SidecarError> {
+    require_api_key(headers, &state.api_key)?;
+    if let Some(tenant) = tenant
+        && !state.allowed_tenants.contains(tenant)
+    {
+        return Err(SidecarError::Forbidden);
+    }
+    let mut limiter = state
+        .rate_limiter
+        .lock()
+        .expect("rate limiter lock poisoned");
+    limiter
+        .try_acquire()
+        .map_err(|error| SidecarError::RateLimited {
+            retry_after_secs: error.retry_after.as_secs().max(1),
+        })
+}
+
+fn response_with_request_id(mut response: Response, request_id: &str) -> Response {
+    response.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        HeaderValue::from_str(request_id).expect("request ID only contains ASCII"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 fn require_api_key(headers: &HeaderMap, expected: &str) -> Result<(), SidecarError> {
@@ -311,7 +460,14 @@ struct OkResponse {
 
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
-    error: String,
+    error: ErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    code: String,
+    message: String,
+    request_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,6 +487,46 @@ enum RouteResponse {
         reason: String,
         failed_or_blocked_nodes: Vec<String>,
     },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+enum PlanResponse {
+    Execute {
+        schema_version: u8,
+        path: Vec<String>,
+        total_cost: f64,
+        cache_hit: bool,
+        steps: Vec<String>,
+    },
+    Recover {
+        reason: String,
+        failed_or_blocked_nodes: Vec<String>,
+        recovery_steps: Vec<String>,
+    },
+}
+
+impl PlanResponse {
+    fn from_outcome(outcome: PlanOutcome) -> Self {
+        match outcome {
+            PlanOutcome::Execute(plan) => Self::Execute {
+                schema_version: plan.schema_version,
+                path: plan.candidate.nodes,
+                total_cost: plan.candidate.score,
+                cache_hit: plan.snapshot.cache_hit,
+                steps: plan.steps.into_iter().map(|step| step.node).collect(),
+            },
+            PlanOutcome::Recover {
+                escalation,
+                recovery,
+                ..
+            } => Self::Recover {
+                reason: format!("{:?}", escalation.reason),
+                failed_or_blocked_nodes: escalation.failed_or_blocked_nodes,
+                recovery_steps: recovery.steps,
+            },
+        }
+    }
 }
 
 impl RouteResponse {
@@ -362,6 +558,10 @@ struct Metrics {
     cache_misses: u64,
     per_tenant: HashMap<String, TenantMetrics>,
     route_latencies: BoundedLatencies,
+    total_plans: u64,
+    successful_plans: u64,
+    recovery_plans: u64,
+    plan_latencies: BoundedLatencies,
 }
 
 impl Metrics {
@@ -415,6 +615,15 @@ impl Metrics {
         outcome
     }
 
+    fn record_plan(&mut self, outcome: &PlanOutcome, latency: Duration) {
+        self.total_plans += 1;
+        self.plan_latencies.push(latency);
+        match outcome {
+            PlanOutcome::Execute(_) => self.successful_plans += 1,
+            PlanOutcome::Recover { .. } => self.recovery_plans += 1,
+        }
+    }
+
     fn to_response(&self, router: &TrustRouter) -> MetricsResponse {
         let tenants = self
             .per_tenant
@@ -435,6 +644,10 @@ impl Metrics {
             cache_hit_ratio: rate(self.cache_hits, self.cache_hits + self.cache_misses),
             node_health: node_health(router, TENANT),
             route_latency_us: self.route_latencies.percentiles(),
+            total_plans: self.total_plans,
+            successful_plans: self.successful_plans,
+            recovery_plans: self.recovery_plans,
+            plan_latency_us: self.plan_latencies.percentiles(),
             tenants,
         }
     }
@@ -514,6 +727,10 @@ struct MetricsResponse {
     cache_hit_ratio: f64,
     node_health: HashMap<String, String>,
     route_latency_us: LatencyPercentiles,
+    total_plans: u64,
+    successful_plans: u64,
+    recovery_plans: u64,
+    plan_latency_us: LatencyPercentiles,
     tenants: HashMap<String, TenantMetricsResponse>,
 }
 

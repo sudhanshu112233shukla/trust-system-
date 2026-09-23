@@ -36,8 +36,8 @@ fn main() {
 }
 
 fn run_pure_react(seed: usize) -> RunResult {
-    let primary_down = seed % 5 == 0;
-    let fallback_down = seed % 11 == 0;
+    let primary_down = seed.is_multiple_of(5);
+    let fallback_down = seed.is_multiple_of(11);
     let mut llm_calls = 1.0;
 
     llm_calls += 1.0;
@@ -67,8 +67,8 @@ fn run_pure_react(seed: usize) -> RunResult {
 
 fn run_trust_router(seed: usize) -> RunResult {
     let router = build_router();
-    let primary_down = seed % 5 == 0;
-    let fallback_down = seed % 11 == 0;
+    let primary_down = seed.is_multiple_of(5);
+    let fallback_down = seed.is_multiple_of(11);
 
     if primary_down {
         open_node(&router, "primary_search");

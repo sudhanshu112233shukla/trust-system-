@@ -47,10 +47,10 @@ fn wait_for_completed_lines(path: &std::path::Path, minimum_lines: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
 
     while Instant::now() < deadline {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if contents.lines().count() >= minimum_lines {
-                return;
-            }
+        if let Ok(contents) = fs::read_to_string(path)
+            && contents.lines().count() >= minimum_lines
+        {
+            return;
         }
         thread::sleep(Duration::from_millis(20));
     }

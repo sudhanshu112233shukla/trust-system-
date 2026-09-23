@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import sys
@@ -38,6 +38,11 @@ def main() -> None:
         api_key=os.environ.get("TRUST_ROUTER_API_KEY", "trust-router-demo-key"),
     )
     wait_for_sidecar(client)
+
+    initial_plan = client.plan("start", "done")
+    print(f"initial_plan={initial_plan}")
+    assert initial_plan["decision"] == "execute"
+    assert initial_plan["steps"] == ["start", "primary_search", "summarize", "done"]
 
     initial = client.route("start", "done")
     print(f"initial={initial}")

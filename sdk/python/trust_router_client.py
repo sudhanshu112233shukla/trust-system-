@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +18,16 @@ class TrustRouterClient:
     def route(self, start: str, goal: str) -> dict[str, Any]:
         response = requests.get(
             f"{self.base_url.rstrip('/')}/route",
+            params={"tenant": self.tenant, "start": start, "goal": goal},
+            timeout=self.timeout_seconds,
+            headers={"X-API-Key": self.api_key},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def plan(self, start: str, goal: str) -> dict[str, Any]:
+        response = requests.get(
+            f"{self.base_url.rstrip('/')}/plan",
             params={"tenant": self.tenant, "start": start, "goal": goal},
             timeout=self.timeout_seconds,
             headers={"X-API-Key": self.api_key},

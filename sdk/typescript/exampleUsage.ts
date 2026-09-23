@@ -1,4 +1,4 @@
-﻿import { TrustRouterClient, type RouteDecision } from "./trustRouterClient.ts";
+import { TrustRouterClient, type RouteDecision } from "./trustRouterClient.ts";
 
 const OPEN_THRESHOLD = 5;
 
@@ -37,6 +37,16 @@ async function main(): Promise<void> {
   const client = new TrustRouterClient({ baseUrl, tenant: "yc-demo", apiKey: process.env.TRUST_ROUTER_API_KEY ?? "trust-router-demo-key" });
 
   await waitForSidecar(baseUrl);
+
+  const initialPlan = await client.plan("start", "done");
+  console.log(`initialPlan=${JSON.stringify(initialPlan)}`);
+  if (
+    initialPlan.decision !== "execute" ||
+    JSON.stringify(initialPlan.steps) !==
+      JSON.stringify(["start", "primary_search", "summarize", "done"])
+  ) {
+    throw new Error(`unexpected execution plan ${JSON.stringify(initialPlan)}`);
+  }
 
   const initial = await client.route("start", "done");
   console.log(`initial=${JSON.stringify(initial)}`);

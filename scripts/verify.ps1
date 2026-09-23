@@ -1,6 +1,3 @@
-﻿$previousTrustRouterApiKey = $env:TRUST_ROUTER_API_KEY
-$env:TRUST_ROUTER_API_KEY = "trust-router-demo-key"
-
 $ErrorActionPreference = "Stop"
 
 function Invoke-Checked {
@@ -13,7 +10,10 @@ function Invoke-Checked {
 }
 
 Invoke-Checked cargo fmt --check
+Invoke-Checked cargo check --all-targets
+Invoke-Checked cargo clippy --all-targets '--' '-D' 'warnings'
 Invoke-Checked cargo test
+Invoke-Checked cargo run --release --bin trust-router-planner-benchmark -- 5000
 Invoke-Checked cargo run --bin trust-router-demo -- demo-audit.jsonl
 Invoke-Checked cargo run --bin trust-router-baseline
 Invoke-Checked cargo run --bin trust-router-loadtest
@@ -113,12 +113,6 @@ finally {
         Wait-Process -Id $escalationSidecar.Id -ErrorAction SilentlyContinue
     }
 }
-if ($null -ne $previousTrustRouterApiKey) {
-    $env:TRUST_ROUTER_API_KEY = $previousTrustRouterApiKey
-} else {
-    Remove-Item Env:\TRUST_ROUTER_API_KEY -ErrorAction SilentlyContinue
-}
-
 Write-Host "Trust Router verification completed successfully."
 
 

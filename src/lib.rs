@@ -1,5 +1,6 @@
 pub mod escalation;
 pub mod health_monitor;
+pub mod planner;
 pub mod sidecar_config;
 pub mod sidecar_security;
 
@@ -127,19 +128,10 @@ impl Default for CostCeilings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TenantCostModel {
     pub weights: CostWeights,
     pub ceilings: CostCeilings,
-}
-
-impl Default for TenantCostModel {
-    fn default() -> Self {
-        Self {
-            weights: CostWeights::default(),
-            ceilings: CostCeilings::default(),
-        }
-    }
 }
 
 impl TenantCostModel {
@@ -804,10 +796,11 @@ impl TenantState {
     }
 
     fn insert_cache(&mut self, key: RouteKey, cached: CachedPath) {
-        if !self.cache.contains_key(&key) && self.cache.len() == ROUTE_CACHE_LIMIT {
-            if let Some(evicted) = self.cache_order.pop_front() {
-                self.cache.remove(&evicted);
-            }
+        if !self.cache.contains_key(&key)
+            && self.cache.len() == ROUTE_CACHE_LIMIT
+            && let Some(evicted) = self.cache_order.pop_front()
+        {
+            self.cache.remove(&evicted);
         }
         self.cache_order.retain(|existing| existing != &key);
         self.cache_order.push_back(key.clone());
@@ -1305,7 +1298,12 @@ mod tests {
 
         let handle =
             router.spawn_recovery_loop(Duration::from_millis(10), Duration::from_millis(5));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while router.node_state("acme", "search") != Some(NodeState::HalfOpen)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         handle.abort();
 
         assert_eq!(

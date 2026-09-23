@@ -134,7 +134,7 @@ async fn run_worker(router: Router, metrics: Arc<LoadMetrics>, worker: usize) ->
     for iteration in 0..OPS_PER_TASK {
         let started = Instant::now();
 
-        if (worker + iteration) % 3 == 0 {
+        if (worker + iteration).is_multiple_of(3) {
             match router.route("load", "start", "done") {
                 RouteDecision::Routed(_) => {
                     metrics.route_successes.fetch_add(1, Ordering::Relaxed);

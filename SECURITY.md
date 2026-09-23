@@ -1,20 +1,27 @@
 # Security
 
-## Covered Today
+## Implemented Controls
 
-- Non-health sidecar endpoints require an `X-API-Key` header.
-- API-key comparison uses constant-time byte comparison.
-- Audit JSONL output escapes control characters so route data does not corrupt the log format.
-- The chaos and durability tests verify explicit failure handling and parseable audit output.
+- `/healthz` is intentionally public for liveness checks. Other sidecar endpoints require `X-API-Key`.
+- API-key comparison performs a fixed-length traversal to avoid early-exit equality behavior.
+- The configured tenant allow-list is enforced for `/route`, `/plan`, `/result`, and `/force-half-open`. A key cannot select an unlisted tenant.
+- Identifiers are limited to 1-128 ASCII alphanumeric, `_`, `-`, or `.` characters. This rejects control characters and prevents JSONL log injection through tenant or node names.
+- Protected endpoints use a bounded token-bucket limiter configured at startup. A limit returns `429` with `Retry-After`.
+- Error responses have a stable schema and do not expose internal filesystem or persistence errors. Protected responses include a request ID and `X-Content-Type-Options: nosniff`.
+- Production startup requires an explicit non-demo API key of at least 32 printable characters, supplied through `TRUST_ROUTER_API_KEY` or `TRUST_ROUTER_API_KEY_FILE`.
+- Audit events are serialized with `serde_json`, appended as JSONL, and synced before a sidecar route or plan response is sent. API keys and headers are never included in audit events or telemetry attributes.
 
-## Not Covered Yet
+## Operational Requirements
 
-- No TLS termination is built into the sidecar. Run it behind a reverse proxy or service mesh that provides TLS in real deployments.
-- API-key auth is a single shared key, not per-tenant credentials or user-level authorization.
-- Graph, health, cache, and circuit-breaker state are in-memory and reset on process restart.
-- There is no horizontal clustering or distributed cache coordination yet.
-- Per-key rate limiting and stricter sidecar input length limits are still future hardening items.
+Terminate TLS outside the sidecar with a reverse proxy, service mesh, or platform ingress. The sidecar does not implement TLS itself. Keep production secrets out of config files committed to Git; prefer environment injection or a mounted secret file.
 
-## Reporting Vulnerabilities
+## Residual Risks and Planned Work
 
-For now, report security issues privately to the project owner before opening public issues. Include reproduction steps, affected endpoint or SDK, expected behavior, and observed behavior.
+- Shared-key authentication plus tenant allow-list is not per-user or per-customer identity.
+- Health, graph, cache, metrics, and circuit-breaker state are in-memory; a restart clears them.
+- Multi-instance coordination, audit tamper evidence, OTLP collector export, and externally hosted security scanning are **PLANNED**.
+- Docker deployment is `NOT VERIFIED` on machines without a working Docker runtime.
+
+## Reporting a Vulnerability
+
+Report vulnerabilities privately to the project owner with a minimal reproduction, affected version or endpoint, expected behavior, observed behavior, and any logs with secrets removed.

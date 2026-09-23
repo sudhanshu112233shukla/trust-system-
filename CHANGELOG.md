@@ -2,15 +2,13 @@
 
 ## 0.1.0 - Initial Hardened Core
 
-- Added deterministic multi-tenant graph routing for agent/tool workflows.
-- Added normalized cost model covering base cost, dollar cost, latency, and risk.
-- Added circuit-breaker health states: `Healthy`, `Degraded`, `Open`, and `HalfOpen`.
-- Added node-scoped path cache invalidation.
-- Added automatic open-to-half-open recovery loop.
-- Added durable JSONL audit export.
-- Added sidecar HTTP API with health, route, result, recovery, and metrics endpoints.
-- Added shared API-key protection for non-health endpoints.
-- Added Python and TypeScript SDK stubs with live sidecar verification.
-- Added LangChain-style tool-loop demonstration using a local stand-in.
-- Added chaos, durability, metrics, auth, and concurrent load coverage.
-- Added Docker packaging files for local sidecar deployment.
+- Deterministic tenant-isolated graph routing with normalized cost, circuit breakers, bounded cache, audit JSONL, recovery probes, and explicit escalation.
+- Axum sidecar, shared-key authentication, SDK examples, metrics, OpenTelemetry stdout export, load/soak/chaos/durability coverage, and Docker packaging.
+
+## Unreleased - Phase 0-3 Planner Hardening
+
+- Added validated sidecar configuration with development/production mode, secret-file support, cost and health policy validation, tenant allow-list, and rate-limit configuration.
+- Added bounded rolling p99 latency samples, bounded audit history, and corrected route/cache/reroute metrics.
+- Added deterministic `ExecutionPlan` and bounded recovery planner with sidecar `/plan` endpoint and planner performance benchmark.
+- Added HTTP security controls: tenant authorization, token-bucket limiting, structured error responses, request IDs, security header, and POST-only mutations.
+- Added Phase 0-3 architecture, audit, baseline, test, and benchmark documentation.

@@ -30,7 +30,7 @@ fn sidecar_metrics_counts_routes_reroutes_escalations_and_health() {
 
     for _ in 0..OPEN_THRESHOLD {
         assert!(
-            http_get(
+            http_post(
                 address,
                 "/result?tenant=yc-demo&node=primary_search&success=false&latency_ms=30000"
             )
@@ -44,7 +44,7 @@ fn sidecar_metrics_counts_routes_reroutes_escalations_and_health() {
 
     for _ in 0..OPEN_THRESHOLD {
         assert!(
-            http_get(
+            http_post(
                 address,
                 "/result?tenant=yc-demo&node=fallback_search&success=false&latency_ms=30000"
             )
@@ -57,6 +57,10 @@ fn sidecar_metrics_counts_routes_reroutes_escalations_and_health() {
             .contains("\"decision\":\"escalate\"")
     );
 
+    let recovery_plan = http_get(address, "/plan?tenant=yc-demo&start=start&goal=done");
+    assert!(recovery_plan.contains("\"decision\":\"recover\""));
+    assert!(recovery_plan.contains("\"recovery_steps\":"));
+
     let metrics = http_get(address, "/metrics");
     assert_eq!(json_u64(&metrics, "total_routes"), 4);
     assert_eq!(json_u64(&metrics, "total_successful_routes"), 3);
@@ -65,6 +69,9 @@ fn sidecar_metrics_counts_routes_reroutes_escalations_and_health() {
     assert_eq!(json_u64(&metrics, "llm_calls_avoided"), 3);
     assert_eq!(json_u64(&metrics, "cache_hits"), 1);
     assert_eq!(json_u64(&metrics, "cache_misses"), 2);
+    assert_eq!(json_u64(&metrics, "total_plans"), 1);
+    assert_eq!(json_u64(&metrics, "successful_plans"), 0);
+    assert_eq!(json_u64(&metrics, "recovery_plans"), 1);
     assert!(metrics.contains("\"escalation_rate\":0.25"));
     assert!(metrics.contains("\"primary_search\":\"Open\""));
     assert!(metrics.contains("\"fallback_search\":\"Open\""));
@@ -118,6 +125,26 @@ fn http_get(address: SocketAddr, target: &str) -> String {
     };
     let request = format!(
         "GET {target} HTTP/1.1\r\nHost: {address}\r\nX-API-Key: test-key\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("request write failed");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("response read failed");
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or(response)
+}
+
+fn http_post(address: SocketAddr, target: &str) -> String {
+    let Ok(mut stream) = TcpStream::connect(address) else {
+        return String::new();
+    };
+    let request = format!(
+        "POST {target} HTTP/1.1\r\nHost: {address}\r\nX-API-Key: test-key\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     stream
         .write_all(request.as_bytes())
