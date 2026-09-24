@@ -24,6 +24,8 @@ cargo run --bin trust-router-demo -- demo-audit.jsonl
 cargo run --bin trust-router-sidecar -- 127.0.0.1:7878 sidecar-audit.jsonl
 ```
 
+The sidecar arguments are the bind address and the JSONL audit file path.
+
 Local development defaults use `X-API-Key: trust-router-demo-key`. Set `TRUST_ROUTER_API_KEY` to choose another key.
 
 ## Planner Model
