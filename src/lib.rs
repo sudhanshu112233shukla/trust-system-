@@ -1,4 +1,6 @@
+pub mod backend;
 pub mod escalation;
+pub mod evaluation;
 pub mod health_monitor;
 pub mod inference;
 pub mod kv;

@@ -151,3 +151,5 @@ Docker files exist, but container validation is `NOT VERIFIED` on a machine with
 - [Phase 4 report](docs/PHASE_4_REPORT.md)
 
 - [Phase 5 report](docs/PHASE_5_REPORT.md)
+
+- [Phases 6-7 report](docs/PHASE_6_7_REPORT.md)
