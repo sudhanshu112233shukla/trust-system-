@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod backend_registry;
+pub mod capacity;
 pub mod control_plane;
 pub mod escalation;
 pub mod evaluation;
