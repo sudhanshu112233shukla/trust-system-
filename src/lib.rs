@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod control_plane;
 pub mod escalation;
 pub mod evaluation;
 pub mod health_monitor;
