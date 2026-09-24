@@ -1,20 +1,60 @@
 # Trust Router
 
-Trust Router is a deterministic planner and routing core for AI-agent tool workflows. It selects a feasible, cost-aware tool path without an LLM control-plane call. When no safe deterministic path exists, it returns an explicit bounded recovery outcome instead of silently skipping work.
+**Deterministic control-plane decisions for AI-agent and inference workflows.**
 
-## What Is Implemented
+Trust Router replaces routine LLM control-plane decisions with a cost-aware, health-aware deterministic planner. It selects a safe path, records the decision durably, and returns an explicit bounded recovery outcome when no feasible path exists.
 
-- Tenant-isolated, deterministic shortest-path routing with normalized cost weights.
-- Circuit breaker states: `Healthy`, `Degraded`, `Open`, and `HalfOpen`.
-- Bounded rolling p99 latency samples per node; `p99_latency_ms` is not the last observed latency.
-- Node-scoped cache invalidation and a bounded per-tenant LRU route cache.
-- Bounded in-memory audit history plus durable append-only JSONL audit records with `sync_all()`.
-- Async health result ingestion and automatic `Open -> HalfOpen` recovery probes.
-- An Axum sidecar with `/route`, `/plan`, `/result`, `/force-half-open`, `/metrics`, and `/healthz`.
-- Explicit `ExecutionPlan` output: validated request, system snapshot, selected candidate, bounded steps, or bounded recovery plan.
-- API-key authentication, tenant allow-list authorization, constant-time key comparison, identifier limits, request IDs, structured errors, and token-bucket rate limiting.
-- Python and TypeScript sidecar clients plus executable local examples.
-- Property, unit, HTTP integration, chaos, durability, load, and soak test coverage.
+> The project optimizes only with declared capabilities and measured inputs. Unknown KV compatibility, quality, latency, or reliability data never becomes an invented benefit.
+
+## Why It Exists
+
+AI-agent workflows often use an LLM to choose ordinary next steps even when graph, cost, health, and policy information already determine a safe choice. Trust Router moves those repeatable decisions into a small, testable Rust control plane.
+
+```text
+request
+  -> validation + tenant authorization
+  -> deterministic routing / inference decision
+  -> bounded ExecutionPlan or bounded recovery
+  -> execution adapter reports outcome
+  -> health, cache, audit, and metrics update
+```
+
+## Capabilities
+
+| Area | Implemented behavior |
+| --- | --- |
+| Routing | Tenant-isolated shortest paths with normalized cost, disabled-edge filtering, and deterministic selection. |
+| Reliability | Healthy, Degraded, Open, and HalfOpen circuit states with automatic recovery probes. |
+| Caching | Bounded per-tenant LRU route cache with node-scoped invalidation. |
+| Planning | Validated, bounded `ExecutionPlan` or explicit bounded recovery plan. |
+| KV intelligence | Version-aware model registry, declared KV capabilities, measurement-backed compatibility checks, and safe normal-prefill fallback. |
+| Inference decisions | Constraint-first filtering, explicit rejection reasons, transparent scoring, deterministic ties, and bounded fallback order. |
+| Execution boundary | Generic `InferenceBackend` trait plus a clearly test-only deterministic mock backend. |
+| Security | API-key auth, tenant allow-list authorization, constant-time comparison, limits, request IDs, structured errors, and rate limiting. |
+| Audit and telemetry | Durable JSONL decisions, bounded metrics, and optional stdout OpenTelemetry metrics. |
+
+## Architecture
+
+```text
+Application / SDK
+      |
+      v
+Axum sidecar  -- auth | authorization | validation | rate limiting
+      |
+      v
+Planner + inference decision engine
+      |-- router graph, health, and bounded route cache
+      |-- model / KV capability and compatibility registries
+      |-- constraint filter, deterministic scoring, bounded fallbacks
+      |
+      +--> ExecutionPlan --> adapter / backend
+      +--> bounded recovery --> operator or explicit LLM escalation
+      |
+      v
+JSONL audit + metrics + health-result ingestion
+```
+
+The planner does **not** execute tools, call an LLM, transfer KV state, schedule GPUs, or make network calls. Those remain adapter/backend responsibilities.
 
 ## Quick Start
 
@@ -24,39 +64,26 @@ cargo run --bin trust-router-demo -- demo-audit.jsonl
 cargo run --bin trust-router-sidecar -- 127.0.0.1:7878 sidecar-audit.jsonl
 ```
 
-The sidecar arguments are the bind address and the JSONL audit file path.
+Local development uses `X-API-Key: trust-router-demo-key`. Set `TRUST_ROUTER_API_KEY` for a different local key.
 
-Local development defaults use `X-API-Key: trust-router-demo-key`. Set `TRUST_ROUTER_API_KEY` to choose another key.
-
-## Planner Model
-
-```text
-request
-  -> request validation
-  -> system snapshot
-  -> candidate generation (routing core)
-  -> feasibility and score validation
-  -> selection
-  -> ExecutionPlan | bounded recovery
-  -> SDK/execution adapter
+```powershell
+curl -H "X-API-Key: trust-router-demo-key" "http://127.0.0.1:7878/plan?tenant=yc-demo&start=start&goal=done"
 ```
 
-The planner does not execute tools, call an LLM, or schedule GPUs. Existing SDK adapters own execution and report outcomes through `/result`. Future adapters for other engines are **PLANNED**, not implemented.
+## API
 
-## Sidecar API
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /healthz` | Unauthenticated process health check. |
+| `GET /route` | Raw deterministic route decision. |
+| `GET /plan` | Bounded execution or recovery plan. |
+| `POST /result` | Report tool/backend outcome for health tracking. |
+| `POST /force-half-open` | Manually trigger a guarded recovery probe. |
+| `GET /metrics` | Bounded route and planner operational metrics. |
 
-All endpoints except `/healthz` require `X-API-Key`. Tenant-specific endpoints also require the tenant to appear in `allowed_tenants`.
+All endpoints except `/healthz` require `X-API-Key`. Tenant endpoints also require a configured allow-list match.
 
-```text
-GET  /healthz
-GET  /route?tenant=yc-demo&start=start&goal=done
-GET  /plan?tenant=yc-demo&start=start&goal=done
-POST /result?tenant=yc-demo&node=primary_search&success=false&latency_ms=30000
-POST /force-half-open?tenant=yc-demo&node=primary_search
-GET  /metrics
-```
-
-`/route` returns a raw router decision. `/plan` returns either:
+A successful plan retains the stable Phase 1 plan shape:
 
 ```json
 {
@@ -69,49 +96,23 @@ GET  /metrics
 }
 ```
 
-or an explicit recovery response:
+Errors have a stable non-secret response shape:
 
 ```json
-{
-  "decision": "recover",
-  "reason": "NoFeasiblePath",
-  "failed_or_blocked_nodes": ["primary_search", "fallback_search"],
-  "recovery_steps": ["Inspect or replace blocked tool: primary_search"]
-}
+{"error":{"code":"tenant_not_authorized","message":"API key is not authorized for this tenant","request_id":"tr-0000000000000001"}}
 ```
 
-Errors use a stable shape:
+## KV and Inference Safety
 
-```json
-{
-  "error": {
-    "code": "tenant_not_authorized",
-    "message": "API key is not authorized for this tenant",
-    "request_id": "tr-0000000000000001"
-  }
-}
-```
+Cross-model KV transfer is selected only when all of the following are registered and sufficient: source/target versions, declared capability, mapping version, positive sample count, latency measurements, quality retention, confidence, and failure rate. Otherwise the planner records a structured fallback reason and selects normal prefill.
 
-Expected status codes: `400` invalid input, `401` missing or invalid key, `403` unauthorized tenant, `405` wrong method, `429` rate limited, and `500` internal persistence failure. Every protected response includes `X-Request-Id` and `X-Content-Type-Options: nosniff`.
+The Phase 5 decision engine filters invalid, over-budget, over-latency, and under-quality candidates before it scores them. A strategy is never selected merely because it is cheaper.
 
-## Configuration
+## Configuration and Security
 
-Copy [sidecar.config.example.json](sidecar.config.example.json) and set `TRUST_ROUTER_CONFIG` to its path. Environment variables override file values. Supported operational settings include:
+Copy [sidecar.config.example.json](sidecar.config.example.json), set `TRUST_ROUTER_CONFIG`, and override operational values with `TRUST_ROUTER_*` environment variables.
 
-- `TRUST_ROUTER_MODE=development|production`
-- `TRUST_ROUTER_API_KEY` or `TRUST_ROUTER_API_KEY_FILE`
-- `TRUST_ROUTER_ALLOWED_TENANTS`
-- `TRUST_ROUTER_RATE_LIMIT_CAPACITY` and `TRUST_ROUTER_RATE_LIMIT_REFILL_PER_SECOND`
-- `TRUST_ROUTER_W_DOLLAR`, `TRUST_ROUTER_W_LATENCY`, `TRUST_ROUTER_W_RISK`, `TRUST_ROUTER_W_BASE`
-- `TRUST_ROUTER_OPEN_THRESHOLD`, `TRUST_ROUTER_HALF_OPEN_SUCCESS_NEEDED`, and `TRUST_ROUTER_COOLDOWN_MS`
-
-Production mode refuses to start with no secret, the demo key, a key shorter than 32 characters, malformed numeric values, unsafe health thresholds, or a missing explicit tenant allow-list.
-
-## Observability
-
-`/metrics` provides bounded p50/p95/p99 samples and route, cache, reroute, escalation, false-escalation, and planner counters. A reroute is counted only when a non-cached successful path changes; it is not synonymous with every successful route.
-
-Set `TRUST_ROUTER_OTEL_STDOUT=true` for the optional stdout OpenTelemetry exporter. Durable JSONL audit records and OTel metrics are separate: JSONL is the decision record; telemetry is for process operations.
+Production startup rejects missing/demo/short API keys, malformed policy values, and an absent tenant allow-list. Use environment variables or mounted secret files for secrets. Deploy behind TLS termination, a reverse proxy, or a service mesh.
 
 ## Verification
 
@@ -126,30 +127,18 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-See [docs/TESTING.md](docs/TESTING.md) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for exact coverage and benchmark interpretation.
+Historical local Phase 3 planner measurements were cache-hit p99 `14us` and forced-miss p99 `53us`; rerun the benchmark on your own hardware before making performance claims.
 
-## Security and Deployment Limits
+## Current Limits
 
-The sidecar has shared-key authentication plus a configured tenant allow-list; it is not a multi-principal identity system. Run it behind TLS termination, a reverse proxy, or a service mesh in production. API keys must be supplied through environment variables or mounted secret files, never committed configuration.
-
-Graph, health, cache, metrics, and circuit-breaker state are in memory. JSONL audit is durable locally, but multiple sidecars do not coordinate routing or health state. Horizontal clustering, distributed state, OTLP collector export, production per-customer identity, and external tool-network validation are **PLANNED**.
-
-Docker files exist, but container validation is `NOT VERIFIED` on a machine without a working Docker runtime.
+- Graph, health, cache, metrics, model registry, and KV registry state are process-local and reset on restart.
+- Audit JSONL is durable locally; clustered sidecars do not coordinate state.
+- Docker files exist but container validation remains **NOT VERIFIED** without a working Docker daemon.
+- The generic mock backend is simulation only. No production inference backend, distributed KV store, GPU scheduler, real cross-model KV transfer, or OneTriangle integration exists.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Architecture audit](docs/ARCHITECTURE_AUDIT.md)
-- [Baseline](docs/BASELINE.md)
-- [Phase 1 report](docs/PHASE_1_REPORT.md)
-- [Phase 2 report](docs/PHASE_2_REPORT.md)
-- [Phase 3 report](docs/PHASE_3_REPORT.md)
-- [Testing](docs/TESTING.md)
-- [Benchmarks](docs/BENCHMARKS.md)
-- [Security](SECURITY.md)
-- [Contributing](CONTRIBUTING.md)
-- [Phase 4 report](docs/PHASE_4_REPORT.md)
-
-- [Phase 5 report](docs/PHASE_5_REPORT.md)
-
-- [Phases 6-7 report](docs/PHASE_6_7_REPORT.md)
+- [Architecture](docs/ARCHITECTURE.md) and [architecture audit](docs/ARCHITECTURE_AUDIT.md)
+- [Testing](docs/TESTING.md), [benchmarks](docs/BENCHMARKS.md), and [baseline](docs/BASELINE.md)
+- [Phase 1](docs/PHASE_1_REPORT.md), [Phase 2](docs/PHASE_2_REPORT.md), [Phase 3](docs/PHASE_3_REPORT.md), [Phase 4](docs/PHASE_4_REPORT.md), [Phase 5](docs/PHASE_5_REPORT.md), and [Phases 6-7](docs/PHASE_6_7_REPORT.md)
+- [Security](SECURITY.md) and [contributing](CONTRIBUTING.md)
