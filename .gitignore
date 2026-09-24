@@ -3,3 +3,10 @@
 docker-data/
 sdk/python/__pycache__/
 node_modules/
+
+# Local secrets and deployment overrides
+secrets/
+*.pem
+*.key
+.env
+.env.*

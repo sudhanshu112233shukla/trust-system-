@@ -1,27 +1,29 @@
 # Security
 
+## Security Boundary
+
+Trust Router is a single-process control plane. It validates and authorizes requests before it uses tenant state; it does not terminate TLS, provide multi-principal identity, execute arbitrary tools, or coordinate multiple instances.
+
 ## Implemented Controls
 
-- `/healthz` is intentionally public for liveness checks. Other sidecar endpoints require `X-API-Key`.
-- API-key comparison performs a fixed-length traversal to avoid early-exit equality behavior.
-- The configured tenant allow-list is enforced for `/route`, `/plan`, `/result`, and `/force-half-open`. A key cannot select an unlisted tenant.
-- Identifiers are limited to 1-128 ASCII alphanumeric, `_`, `-`, or `.` characters. This rejects control characters and prevents JSONL log injection through tenant or node names.
-- Protected endpoints use a bounded token-bucket limiter configured at startup. A limit returns `429` with `Retry-After`.
-- Error responses have a stable schema and do not expose internal filesystem or persistence errors. Protected responses include a request ID and `X-Content-Type-Options: nosniff`.
-- Production startup requires an explicit non-demo API key of at least 32 printable characters, supplied through `TRUST_ROUTER_API_KEY` or `TRUST_ROUTER_API_KEY_FILE`.
-- Audit events are serialized with `serde_json`, appended as JSONL, and synced before a sidecar route or plan response is sent. API keys and headers are never included in audit events or telemetry attributes.
+- `/healthz` is the only public endpoint. Protected endpoints require `X-API-Key`; comparisons avoid early exit.
+- Tenant allow-list authorization applies to every tenant-scoped endpoint.
+- Request identifiers are restricted to 1-128 ASCII safe characters, preventing control-character log injection.
+- Token-bucket rate limiting returns `429` and `Retry-After` before routing work is performed.
+- Errors have a stable, non-secret JSON shape. Responses include request IDs and `X-Content-Type-Options: nosniff`.
+- Production startup rejects missing/demo/short secrets, unsafe configuration, and missing allow-lists. Use `TRUST_ROUTER_API_KEY` or `TRUST_ROUTER_API_KEY_FILE`.
+- JSONL audit events use `serde_json`, are synced before route/plan responses, and exclude keys, headers, and payload secrets.
+- CI runs formatting, lint, tests, documentation build, SDK syntax/type checks, dependency review on pull requests, secret scanning, and Docker image build.
+- Compose defaults drop Linux capabilities, prevent privilege escalation, use a read-only root filesystem, and retain only the mounted audit volume as writable state.
 
-## Operational Requirements
+## Deployment Requirements
 
-Terminate TLS outside the sidecar with a reverse proxy, service mesh, or platform ingress. The sidecar does not implement TLS itself. Keep production secrets out of config files committed to Git; prefer environment injection or a mounted secret file.
+Terminate TLS at a reverse proxy, ingress, or service mesh. Inject credentials through an environment secret or mounted secret file. Do not commit `secrets/`, `.env`, PEM files, or keys. Restrict network access so only authorized clients can reach the sidecar.
 
-## Residual Risks and Planned Work
+## Residual Risks
 
-- Shared-key authentication plus tenant allow-list is not per-user or per-customer identity.
-- Health, graph, cache, metrics, and circuit-breaker state are in-memory; a restart clears them.
-- Multi-instance coordination, audit tamper evidence, OTLP collector export, and externally hosted security scanning are **PLANNED**.
-- Docker deployment is `NOT VERIFIED` on machines without a working Docker runtime.
+Shared-key authentication is not per-user identity; state is in-memory; audit JSONL is not tamper-evident; and multiple sidecars do not coordinate health or cache state. The Docker image is built in CI, but local runtime verification remains **NOT VERIFIED** until a Docker daemon is available.
 
-## Reporting a Vulnerability
+## Vulnerability Reporting
 
-Report vulnerabilities privately to the project owner with a minimal reproduction, affected version or endpoint, expected behavior, observed behavior, and any logs with secrets removed.
+Report vulnerabilities privately to the project owner with affected version, reproduction steps, expected and observed behavior, and sanitized logs. Do not open public issues containing credentials or exploit details.

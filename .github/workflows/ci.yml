@@ -9,12 +9,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings
@@ -26,15 +31,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
+        with: { node-version: 22, cache: npm }
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+        with: { python-version: '3.13' }
       - run: npm ci
       - run: npm run tsc
       - run: python -m py_compile sdk/python/*.py
+
+  security:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+      - uses: actions/dependency-review-action@v4
+        if: github.event_name == 'pull_request'
 
   container-build:
     runs-on: ubuntu-24.04

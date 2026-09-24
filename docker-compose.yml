@@ -1,4 +1,4 @@
-﻿services:
+services:
   trust-router-sidecar:
     build:
       context: .
@@ -7,7 +7,7 @@
     command: ["0.0.0.0:7878", "/audit/sidecar-audit.jsonl"]
     ports:
       - "7878:7878"
-    volumes:
+    security_opt:`n      - no-new-privileges:true`n    cap_drop:`n      - ALL`n    read_only: true`n    tmpfs:`n      - /tmp`n    volumes:
       - ./docker-data/audit:/audit
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7878/healthz"]
@@ -21,7 +21,7 @@
       trust-router-sidecar:
         condition: service_healthy
     working_dir: /app
-    volumes:
+    security_opt:`n      - no-new-privileges:true`n    cap_drop:`n      - ALL`n    read_only: true`n    tmpfs:`n      - /tmp`n    volumes:
       - ./sdk/python:/app:ro
     command: ["python", "/app/compose_agent.py"]
 
