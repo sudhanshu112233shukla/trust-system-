@@ -148,3 +148,4 @@ Docker files exist, but container validation is `NOT VERIFIED` on a machine with
 - [Benchmarks](docs/BENCHMARKS.md)
 - [Security](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
+- [Phase 4 report](docs/PHASE_4_REPORT.md)

@@ -5,6 +5,7 @@
 //! recovery plan when deterministic routing cannot proceed.
 
 use crate::escalation::{BoundedRecoveryAdapter, EscalationAdapter, RecoveryPlan};
+use crate::kv::{KvIntelligence, KvPlanMetadata, KvPlanningContext};
 use crate::{EscalationContext, NodeId, Route, RouteDecision, Router, TenantId};
 
 pub const MAX_EXECUTION_PLAN_STEPS: usize = 64;
@@ -91,6 +92,7 @@ pub struct ExecutionPlan {
     pub snapshot: SystemSnapshot,
     pub candidate: Candidate,
     pub steps: Vec<ExecutionStep>,
+    pub kv: KvPlanMetadata,
 }
 
 /// Planning always returns something explicit: executable work or bounded recovery.
@@ -110,6 +112,7 @@ pub struct Planner {
     router: Router,
     max_steps: usize,
     recovery_adapter: BoundedRecoveryAdapter,
+    kv: KvIntelligence,
 }
 
 impl Planner {
@@ -122,7 +125,13 @@ impl Planner {
             router,
             max_steps: max_steps.clamp(1, MAX_EXECUTION_PLAN_STEPS),
             recovery_adapter: BoundedRecoveryAdapter::new(max_recovery_steps),
+            kv: KvIntelligence::default(),
         }
+    }
+
+    pub fn with_kv_intelligence(mut self, kv: KvIntelligence) -> Self {
+        self.kv = kv;
+        self
     }
 
     /// Analyze, generate, validate, score, and select a deterministic execution plan.
@@ -148,6 +157,21 @@ impl Planner {
                     recovery,
                 })
             }
+        }
+    }
+
+    pub fn plan_with_kv(
+        &self,
+        request: PlanningRequest,
+        context: KvPlanningContext,
+    ) -> Result<PlanOutcome, PlanningError> {
+        let outcome = self.plan(request)?;
+        match outcome {
+            PlanOutcome::Execute(mut plan) => {
+                plan.kv = self.kv.select(&context);
+                Ok(PlanOutcome::Execute(plan))
+            }
+            recovery => Ok(recovery),
         }
     }
 
@@ -193,6 +217,7 @@ impl Planner {
             snapshot,
             candidate,
             steps,
+            kv: self.kv.normal(),
         }))
     }
 }
@@ -341,6 +366,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn kv_capability_is_selected_only_when_the_model_declares_it() {
+        use crate::kv::{KvStrategy, ModelCapabilities, ModelMetadata, ModelReference};
+        let mut kv = KvIntelligence::default();
+        kv.models
+            .register(ModelMetadata {
+                model: ModelReference::new("model-a", "1"),
+                kv_layout: "layout-v1".into(),
+                capabilities: ModelCapabilities::normal_prefill().with_kv(KvStrategy::PrefixCache),
+            })
+            .unwrap();
+        let plan = Planner::new(sample_router())
+            .with_kv_intelligence(kv)
+            .plan_with_kv(
+                PlanningRequest::new("acme", "start", "done"),
+                KvPlanningContext {
+                    target: ModelReference::new("model-a", "1"),
+                    source: None,
+                    requested: KvStrategy::PrefixCache,
+                },
+            )
+            .unwrap();
+        let PlanOutcome::Execute(plan) = plan else {
+            panic!("expected plan")
+        };
+        assert_eq!(plan.kv.strategy, KvStrategy::PrefixCache);
+        assert_eq!(plan.kv.fallback_reason, None);
+    }
+
+    #[test]
+    fn unknown_cross_model_measurements_fall_back_to_normal_prefill() {
+        use crate::kv::{
+            KvCompatibilityRecord, KvStrategy, ModelCapabilities, ModelMetadata, ModelReference,
+        };
+        let mut kv = KvIntelligence::default();
+        for id in ["model-a", "model-b"] {
+            kv.models
+                .register(ModelMetadata {
+                    model: ModelReference::new(id, "1"),
+                    kv_layout: "layout-v1".into(),
+                    capabilities: ModelCapabilities::normal_prefill()
+                        .with_kv(KvStrategy::CrossModelKvTransfer),
+                })
+                .unwrap();
+        }
+        kv.compatibility
+            .register(KvCompatibilityRecord::unknown(
+                ModelReference::new("model-a", "1"),
+                ModelReference::new("model-b", "1"),
+            ))
+            .unwrap();
+        let plan = Planner::new(sample_router())
+            .with_kv_intelligence(kv)
+            .plan_with_kv(
+                PlanningRequest::new("acme", "start", "done"),
+                KvPlanningContext {
+                    target: ModelReference::new("model-b", "1"),
+                    source: Some(ModelReference::new("model-a", "1")),
+                    requested: KvStrategy::CrossModelKvTransfer,
+                },
+            )
+            .unwrap();
+        let PlanOutcome::Execute(plan) = plan else {
+            panic!("expected plan")
+        };
+        assert_eq!(plan.kv.strategy, KvStrategy::None);
+        assert!(plan.kv.fallback_reason.is_some());
+    }
     fn sample_router() -> Router {
         let router = Router::new();
         router.add_tenant("acme");
