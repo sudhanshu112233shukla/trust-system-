@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod backend;
 pub mod backend_registry;
 pub mod capacity;
