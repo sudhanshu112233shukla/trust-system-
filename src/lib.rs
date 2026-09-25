@@ -16,6 +16,7 @@ pub mod planner;
 pub mod sidecar_config;
 pub mod sidecar_security;
 pub mod system_planning;
+pub mod pipeline;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
