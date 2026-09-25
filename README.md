@@ -28,7 +28,7 @@ request
 | Caching | Bounded per-tenant LRU route cache with node-scoped invalidation. |
 | Planning | Validated, bounded `ExecutionPlan` or explicit bounded recovery plan. |
 | KV intelligence | Version-aware model registry, declared KV capabilities, measurement-backed compatibility checks, and safe normal-prefill fallback. |
-| Inference decisions | Constraint-first filtering, explicit rejection reasons, transparent scoring, deterministic ties, and bounded fallback order. |
+| Inference decisions | Constraint-first filtering, explicit rejection reasons, transparent scoring, deterministic ties, and bounded fallback order. |`r`n| System feasibility | Deterministic composition of capacity snapshots, declared backend capabilities, inference constraints, and scoring. |`r`n| Execution boundary | Validated backend handoff that records only consistent observed results through the async health-monitor path. |`r`n| Decision traces | Bounded, schema-versioned selection/rejection explanations with stable redacted reason codes. |
 | Execution boundary | Generic `InferenceBackend` trait plus a clearly test-only deterministic mock backend. |
 | Security | API-key auth, tenant allow-list authorization, constant-time comparison, limits, request IDs, structured errors, and rate limiting. |
 | Audit and telemetry | Durable JSONL decisions, bounded metrics, and optional stdout OpenTelemetry metrics. |
@@ -79,7 +79,7 @@ curl -H "X-API-Key: trust-router-demo-key" "http://127.0.0.1:7878/plan?tenant=yc
 | `GET /plan` | Bounded execution or recovery plan. |
 | `POST /result` | Report tool/backend outcome for health tracking. |
 | `POST /force-half-open` | Manually trigger a guarded recovery probe. |
-| `GET /metrics` | Bounded route and planner operational metrics. |
+| `GET /metrics` | Bounded route and planner operational metrics. |`r`n`r`n`SystemPlanner`, `ExecutionCoordinator`, and `DecisionTrace` are library integration boundaries today; they are not exposed as a separate sidecar endpoint yet.
 
 All endpoints except `/healthz` require `X-API-Key`. Tenant endpoints also require a configured allow-list match.
 
@@ -138,7 +138,7 @@ Historical local Phase 3 planner measurements were cache-hit p99 `14us` and forc
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) and [architecture audit](docs/ARCHITECTURE_AUDIT.md)
+- [Architecture](docs/ARCHITECTURE.md) and [architecture audit](docs/ARCHITECTURE_AUDIT.md)`r`n- [System planning](docs/SYSTEM_PLANNING.md), [decision traces](docs/DECISION_TRACES.md), and [execution boundary](docs/EXECUTION.md)
 - [Testing](docs/TESTING.md), [benchmarks](docs/BENCHMARKS.md), and [baseline](docs/BASELINE.md)
 - [Phase 1](docs/PHASE_1_REPORT.md), [Phase 2](docs/PHASE_2_REPORT.md), [Phase 3](docs/PHASE_3_REPORT.md), [Phase 4](docs/PHASE_4_REPORT.md), [Phase 5](docs/PHASE_5_REPORT.md), and [Phases 6-7](docs/PHASE_6_7_REPORT.md)
 - [Security](SECURITY.md) and [contributing](CONTRIBUTING.md)
