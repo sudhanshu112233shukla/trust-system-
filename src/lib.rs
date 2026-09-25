@@ -7,6 +7,7 @@ pub mod decision_trace;
 pub mod escalation;
 pub mod evaluation;
 pub mod execution;
+pub mod fabric;
 pub mod health_monitor;
 pub mod inference;
 pub mod intelligence;

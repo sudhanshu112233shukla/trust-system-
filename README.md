@@ -1,181 +1,71 @@
 # Trust Router
+Deterministic control-plane decisions for AI-agent and inference workflows.
 
-**Deterministic control-plane decisions for AI-agent and inference workflows.**
+## What It Is
+Trust Router sits above inference execution engines. It observes inference outcomes, applies policy, and evaluates deterministic execution bounds before compiling safe execution plans. It does not replace serving layers (like vLLM) but decides how and when they are used.
 
-Trust Router replaces routine LLM control-plane decisions with a cost-aware, health-aware deterministic planner. It selects a safe path, records the decision durably, and retus an explicit bounded recovery outcome when no feasible path exists.
+## The Problem
+Standard agent architectures couple model execution with physical capacity/KV intelligence routing. Trust Router isolates decision-making.
 
-> The project optimizes only with declared capabilities and measured inputs. Unknown KV compatibility, quality, latency, or reliability data never becomes an invented benefit.
-
-## Why It Exists
-
-AI-agent workflows often use an LLM to choose ordinary next steps even when graph, cost, health, and policy information already determine a safe choice. Trust Router moves those repeatable decisions into a small, testable Rust control plane.
-
-```text
-request
-  -> validation + tenant authorization
-  -> deterministic routing / inference decision
-  -> bounded ExecutionPlan or bounded recovery
-  -> execution adapter reports outcome
-  -> health, cache, audit, and metrics update
-```
-
-## Capabilities
-
-| Area | Implemented behavior |
-| --- | --- |
-| Routing | Tenant-isolated shortest paths with normalized cost, disabled-edge filtering, and deterministic selection. |
-| Reliability | Healthy, Degraded, Open, and HalfOpen circuit states with automatic recovery probes. |
-| Caching | Bounded per-tenant LRU route cache with node-scoped invalidation. |
-| Planning | Validated, bounded `ExecutionPlan` or explicit bounded recovery plan. |
-| KV intelligence | Version-aware model registry, declared KV capabilities, measurement-backed compatibility checks, and safe normal-prefill fallback. |
-| Inference decisions | Constraint-first filtering, explicit rejection reasons, transparent scoring, deterministic ties, and bounded fallback order. || System feasibility | Deterministic composition of capacity snapshots, declared backend capabilities, inference constraints, and scoring. || Execution boundary | Validated backend handoff that records only consistent observed results through the async health-monitor path. || Decision traces | Bounded, schema-versioned selection/rejection explanations with stable redacted reason codes. |
-| Execution boundary | Generic `InferenceBackend` trait plus a clearly test-only deterministic mock backend. |
-| Security | API-key auth, tenant allow-list authorization, constant-time comparison, limits, request IDs, structured errors, and rate limiting. |
-| Audit and telemetry | Durable JSONL decisions, bounded metrics, and optional stdout OpenTelemetry metrics. |
+## Design Principles
+- Deterministic safety
+- Monotonic state revisions
+- Zero-trust execution telemetry
 
 ## Architecture
+```text
+Client / SDK
+|
+API + Auth
+|
+Admission Control
+|
+Trust Intelligence
+|
+Decision Firewall
+|
+Execution Compiler
+|
+Inference Fabric
+|
+Backend / GPU / KV
+|
+Observation
+|
+Prediction Error
+|
+Decision Memory
+```
 
-                    ┌──────────────────────┐
-                    │      Client / SDK     │
-                    └──────────┬───────────┘
-                               ↓
-                    ┌──────────────────────┐
-                    │ Auth + Tenant Policy │
-                    └──────────┬───────────┘
-                               ↓
-                    ┌──────────────────────┐
-                    │ Admission / Quotas   │
-                    └──────────┬───────────┘
-                               ↓
-        ┌──────────────────────────────────────────┐
-        │          TRUST INTELLIGENCE               │
-        │                                           │
-        │ World State                               │
-        │ Prediction Engine                         │
-        │ Counterfactual Engine                     │
-        │ KV Intelligence                           │
-        │ SLO / Utility                             │
-        │ Decision Memory                           │
-        └─────────────────────┬────────────────────┘
-                              ↓
-                    ┌──────────────────────┐
-                    │  DECISION FIREWALL   │
-                    │ deterministic safety │
-                    └──────────┬───────────┘
-                               ↓
-                    ┌──────────────────────┐
-                    │ Execution Compiler   │
-                    └──────────┬───────────┘
-                               ↓
-       ┌─────────────────────────────────────────────┐
-       │             INFERENCE FABRIC                │
-       │                                             │
-       │ vLLM adapter | OpenAI adapter | Custom     │
-       │ GPU/CPU/accelerator                          │
-       │ Prefill / Decode                            │
-       │ Local / Remote KV                           │
-       │ Admission / Backpressure                    │
-       └─────────────────────┬───────────────────────┘
-                             ↓
-                    ┌──────────────────────┐
-                    │     Observation      │
-                    └──────────┬───────────┘
-                               ↓
-                 ┌──────────────────────────┐
-                 │ Prediction Error Engine  │
-                 └────────────┬─────────────┘
-                              ↓
-                 ┌──────────────────────────┐
-                 │ Decision Memory / Audit  │
-                 └────────────┬─────────────┘
-                              │
-                              └──────→ next decision
+## Core Decision Pipeline
+Observe → Build World State → Predict → Generate Counterfactuals → Apply SLO → Decision Firewall → Compile Execution Plan → Execute → Observe Actual Result → Measure Prediction Error → Improve Future Decisions.
 
-The planner does **not** execute tools, call an LLM, transfer KV state, schedule GPUs, or make network calls. Those remain adapter/backend responsibilities.
+## Capabilities
+| Capability | Status | Description |
+|---|---|---|
+| Safety boundary | Implemented | Prevents SLO violations. |
+| Predictive Inference Intelligence | Planning-only | Basic online constraints structure. |
+| KV Intelligence | Experimental | Compatibility tracking and routing logic. |
+| Execution Fabric | Adapter boundary | Transport abstractions for engines. |
+| Admission and Backpressure | Implemented | Concurrency limits and shedding. |
 
 ## Quick Start
-
-```powershell
-cargo test
-cargo run --bin trust-router-demo -- demo-audit.jsonl
-cargo run --bin trust-router-sidecar -- 127.0.0.1:7878 sidecar-audit.jsonl
-```
-
-Local development uses `X-API-Key: trust-router-demo-key`. Set `TRUST_ROUTER_API_KEY` for a different local key.
-
-```powershell
-curl -H "X-API-Key: trust-router-demo-key" "http://127.0.0.1:7878/plan?tenant=yc-demo&start=start&goal=done"
-```
-
-## API
-
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /healthz` | Unauthenticated process health check. |
-| `GET /route` | Raw deterministic route decision. |
-| `GET /plan` | Bounded execution or recovery plan. |
-| `POST /result` | Report tool/backend outcome for health tracking. |
-| `POST /force-half-open` | Manually trigger a guarded recovery probe. |
-| `GET /metrics` | Bounded route and planner operational metrics. |`SystemPlanner`, `ExecutionCoordinator`, and `DecisionTrace` are library integration boundaries today; they are not exposed as a separate sidecar endpoint yet.
-
-All endpoints except `/healthz` require `X-API-Key`. Tenant endpoints also require a configured allow-list match.
-
-A successful plan retains the stable Phase 1 plan shape:
-
-```json
-{
-  "decision": "execute",
-  "schema_version": 1,
-  "path": ["start", "primary_search", "summarize", "done"],
-  "total_cost": 0.438,
-  "cache_hit": false,
-  "steps": ["start", "primary_search", "summarize", "done"]
-}
-```
-
-Errors have a stable non-secret response shape:
-
-```json
-{"error":{"code":"tenant_not_authorized","message":"API key is not authorized for this tenant","request_id":"tr-0000000000000001"}}
-```
-
-## KV and Inference Safety
-
-Cross-model KV transfer is selected only when all of the following are registered and sufficient: source/target versions, declared capability, mapping version, positive sample count, latency measurements, quality retention, confidence, and failure rate. Otherwise the planner records a structured fallback reason and selects normal prefill.
-
-The Phase 5 decision engine filters invalid, over-budget, over-latency, and under-quality candidates before it scores them. A strategy is never selected merely because it is cheaper.
-
-## Configuration and Security
-
-Copy [sidecar.config.example.json](sidecar.config.example.json), set `TRUST_ROUTER_CONFIG`, and override operational values with `TRUST_ROUTER_*` environment variables.
-
-Production startup rejects missing/demo/short API keys, malformed policy values, and an absent tenant allow-list. Use environment variables or mounted secret files for secrets. Deploy behind TLS termination, a reverse proxy, or a service mesh.
-
-## Verification
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\verify.ps1
-cargo run --bin trust-router-loadtest
-cargo run --bin trust-router-soaktest -- 300 200
-cargo run --release --bin trust-router-planner-benchmark -- 20000
-cargo fmt --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D waings
+```bash
+cargo build --release
 cargo test
 ```
 
-Historical local Phase 3 planner measurements were cache-hit p99 `14us` and forced-miss p99 `53us`; rerun the benchmark on your own hardware before making performance claims.
+## Configuration
+Requires valid cost weights, admission limits, and tenant capabilities.
 
-## Current Limits
+## Testing
+`cargo test` runs all property, unit, and deterministic logic verification tests.
 
-- Graph, health, cache, metrics, model registry, and KV registry state are process-local and reset on restart.
-- Audit JSONL is durable locally; clustered sidecars do not coordinate state.
-- Docker files exist but container validation remains **NOT VERIFIED** without a working Docker daemon.
-- The generic mock backend is simulation only. No production inference backend, distributed KV store, GPU scheduler, real cross-model KV transfer, or OneTriangle integration exists.
+## Security
+No prompts or secrets are saved in telemetry/trace records.
 
-## Documentation
+## Limitations
+Distributed state is mocked via in-memory interfaces. Not a drop-in replacement for vLLM. No automatic self-learning logic.
 
-- [Architecture](docs/ARCHITECTURE.md) and [architecture audit](docs/ARCHITECTURE_AUDIT.md)- [System planning](docs/SYSTEM_PLANNING.md), [decision traces](docs/DECISION_TRACES.md), and [execution boundary](docs/EXECUTION.md)
-- [Testing](docs/TESTING.md), [benchmarks](docs/BENCHMARKS.md), and [baseline](docs/BASELINE.md)
-- [Phase 1](docs/PHASE_1_REPORT.md), [Phase 2](docs/PHASE_2_REPORT.md), [Phase 3](docs/PHASE_3_REPORT.md), [Phase 4](docs/PHASE_4_REPORT.md), [Phase 5](docs/PHASE_5_REPORT.md), and [Phases 6-7](docs/PHASE_6_7_REPORT.md)
-- [Security](SECURITY.md) and [contributing](CONTRIBUTING.md)
+## License
+MIT

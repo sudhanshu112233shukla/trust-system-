@@ -1,3 +1,0 @@
-# Control-Plane Snapshots
-
-`ControlPlaneSnapshot` is the in-process immutable input boundary for future full inference planning. It carries explicit graph, health, model, KV, policy, capacity, and planner versions; model and KV registry revisions are captured from their registries. A snapshot comparison is exact: any changed version makes a prior decision context stale. This commit introduces the contract only; router cache keys and sidecar snapshot publication are future work.
