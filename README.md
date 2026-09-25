@@ -35,24 +35,61 @@ request
 
 ## Architecture
 
-```text
-Application / SDK
-      |
-      v
-Axum sidecar  -- auth | authorization | validation | rate limiting
-      |
-      v
-Planner + inference decision engine
-      |-- router graph, health, and bounded route cache
-      |-- model / KV capability and compatibility registries
-      |-- constraint filter, deterministic scoring, bounded fallbacks
-      |
-      +--> ExecutionPlan --> adapter / backend
-      +--> bounded recovery --> operator or explicit LLM escalation
-      |
-      v
-JSONL audit + metrics + health-result ingestion
-```
+                    ┌──────────────────────┐
+                    │      Client / SDK     │
+                    └──────────┬───────────┘
+                               ↓
+                    ┌──────────────────────┐
+                    │ Auth + Tenant Policy │
+                    └──────────┬───────────┘
+                               ↓
+                    ┌──────────────────────┐
+                    │ Admission / Quotas   │
+                    └──────────┬───────────┘
+                               ↓
+        ┌──────────────────────────────────────────┐
+        │          TRUST INTELLIGENCE               │
+        │                                           │
+        │ World State                               │
+        │ Prediction Engine                         │
+        │ Counterfactual Engine                     │
+        │ KV Intelligence                           │
+        │ SLO / Utility                             │
+        │ Decision Memory                           │
+        └─────────────────────┬────────────────────┘
+                              ↓
+                    ┌──────────────────────┐
+                    │  DECISION FIREWALL   │
+                    │ deterministic safety │
+                    └──────────┬───────────┘
+                               ↓
+                    ┌──────────────────────┐
+                    │ Execution Compiler   │
+                    └──────────┬───────────┘
+                               ↓
+       ┌─────────────────────────────────────────────┐
+       │             INFERENCE FABRIC                │
+       │                                             │
+       │ vLLM adapter | OpenAI adapter | Custom     │
+       │ GPU/CPU/accelerator                          │
+       │ Prefill / Decode                            │
+       │ Local / Remote KV                           │
+       │ Admission / Backpressure                    │
+       └─────────────────────┬───────────────────────┘
+                             ↓
+                    ┌──────────────────────┐
+                    │     Observation      │
+                    └──────────┬───────────┘
+                               ↓
+                 ┌──────────────────────────┐
+                 │ Prediction Error Engine  │
+                 └────────────┬─────────────┘
+                              ↓
+                 ┌──────────────────────────┐
+                 │ Decision Memory / Audit  │
+                 └────────────┬─────────────┘
+                              │
+                              └──────→ next decision
 
 The planner does **not** execute tools, call an LLM, transfer KV state, schedule GPUs, or make network calls. Those remain adapter/backend responsibilities.
 
