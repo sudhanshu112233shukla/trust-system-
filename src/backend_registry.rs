@@ -81,6 +81,22 @@ impl BackendRegistry {
         self.revision += 1;
         Ok(())
     }
+    /// Checks a declared capability without executing a backend.
+    ///
+    /// Planning uses this gate before selection so a selected strategy cannot
+    /// reach an adapter that never advertised support for it.
+    pub fn supports(
+        &self,
+        backend_id: &str,
+        model: &ModelReference,
+        strategy: KvStrategy,
+    ) -> Result<bool, BackendRegistryError> {
+        let entry = self
+            .entries
+            .get(backend_id)
+            .ok_or_else(|| BackendRegistryError::UnknownBackend(backend_id.into()))?;
+        Ok(entry.descriptor.supports(model, strategy))
+    }
     pub fn execute(
         &self,
         backend_id: &str,
@@ -162,6 +178,20 @@ mod tests {
             registry.execute("mock", &unsupported),
             Err(BackendRegistryError::UnsupportedCapability { .. })
         ));
+    }
+    #[test]
+    fn supports_checks_declarations_without_executing() {
+        let (registry, request) = setup();
+        assert!(
+            registry
+                .supports("mock", &request.model, KvStrategy::None)
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .supports("mock", &request.model, KvStrategy::PrefixCache)
+                .unwrap()
+        );
     }
     #[test]
     fn registry_is_ordered_and_rejects_duplicates() {
