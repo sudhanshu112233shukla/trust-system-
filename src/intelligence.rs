@@ -1,6 +1,6 @@
+use crate::{NodeId, TenantId};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
-use crate::{NodeId, TenantId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntelligenceError {
@@ -57,12 +57,19 @@ pub struct InferenceObservation {
 
 impl InferenceObservation {
     pub fn validate(&self) -> Result<(), IntelligenceError> {
-        if self.request_id.is_empty() { return Err(IntelligenceError::InvalidObservation("empty request_id")); }
-        if self.gpu_utilization.is_nan() || self.gpu_utilization < 0.0 || self.gpu_utilization > 1.0 { 
-            return Err(IntelligenceError::InvalidObservation("invalid gpu_utilization")); 
+        if self.request_id.is_empty() {
+            return Err(IntelligenceError::InvalidObservation("empty request_id"));
+        }
+        if self.gpu_utilization.is_nan() || self.gpu_utilization < 0.0 || self.gpu_utilization > 1.0
+        {
+            return Err(IntelligenceError::InvalidObservation(
+                "invalid gpu_utilization",
+            ));
         }
         if self.quality_score.is_nan() || self.quality_score < 0.0 || self.quality_score > 1.0 {
-            return Err(IntelligenceError::InvalidObservation("invalid quality_score")); 
+            return Err(IntelligenceError::InvalidObservation(
+                "invalid quality_score",
+            ));
         }
         if self.actual_cost.is_nan() || self.actual_cost < 0.0 {
             return Err(IntelligenceError::InvalidObservation("invalid actual_cost"));
@@ -153,14 +160,82 @@ pub struct DecisionMemory {
 
 impl DecisionMemory {
     pub fn new(max_size: usize) -> Self {
-        Self { max_size, memory: VecDeque::new() }
+        Self {
+            max_size,
+            memory: VecDeque::new(),
+        }
     }
-    
+
     pub fn record(&mut self, record: String) {
         if self.memory.len() >= self.max_size {
             self.memory.pop_front();
         }
         self.memory.push_back(record);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UtilityConfig {
+    pub weight_latency: f64,
+    pub weight_throughput: f64,
+    pub weight_reliability: f64,
+    pub weight_quality: f64,
+    pub weight_cost: f64,
+    pub weight_kv_transfer: f64,
+    pub max_ttft: u64,
+    pub max_tpot: u64,
+    pub max_e2e: u64,
+    pub min_quality: f64,
+    pub max_cost: f64,
+    pub max_failure_probability: f64,
+}
+
+impl UtilityConfig {
+    pub fn is_valid(&self) -> bool {
+        self.weight_latency >= 0.0
+            && self.weight_throughput >= 0.0
+            && self.weight_reliability >= 0.0
+            && self.weight_quality >= 0.0
+            && self.weight_cost >= 0.0
+            && self.weight_kv_transfer >= 0.0
+    }
+}
+
+pub struct DecisionFirewall {
+    pub config: UtilityConfig,
+}
+
+impl DecisionFirewall {
+    pub fn evaluate_candidate(
+        &self,
+        candidate: &CounterfactualEstimate,
+        world_state: &WorldState,
+    ) -> Result<(), &'static str> {
+        if !self.config.is_valid() {
+            return Err("INVALID_CONFIGURATION");
+        }
+        if world_state.is_stale(Duration::from_secs(300)) {
+            return Err("STALE_WORLD_STATE");
+        }
+        if candidate.predicted_ttft > self.config.max_ttft {
+            return Err("SLO_VIOLATION_TTFT");
+        }
+        if candidate.predicted_tpot > self.config.max_tpot {
+            return Err("SLO_VIOLATION_TPOT");
+        }
+        if candidate.predicted_e2e > self.config.max_e2e {
+            return Err("SLO_VIOLATION_E2E");
+        }
+        if candidate.quality_risk < self.config.min_quality {
+            return Err("SLO_VIOLATION_QUALITY");
+        }
+        if candidate.predicted_cost > self.config.max_cost {
+            return Err("SLO_VIOLATION_COST");
+        }
+        if candidate.predicted_failure_probability > self.config.max_failure_probability {
+            return Err("SLO_VIOLATION_RELIABILITY");
+        }
+        Ok(())
     }
 }
 
@@ -223,7 +298,7 @@ mod tests {
         assert!(ws.is_stale(Duration::from_secs(5)));
         assert!(!ws.is_stale(Duration::from_secs(15)));
     }
-    
+
     #[test]
     fn test_decision_memory() {
         let mut dm = DecisionMemory::new(2);
@@ -232,5 +307,64 @@ mod tests {
         dm.record("req-3".into());
         assert_eq!(dm.memory.len(), 2);
         assert_eq!(dm.memory.front().unwrap(), "req-2");
+    }
+
+    #[test]
+    fn test_decision_firewall() {
+        let config = UtilityConfig {
+            weight_latency: 1.0,
+            weight_throughput: 1.0,
+            weight_reliability: 1.0,
+            weight_quality: 1.0,
+            weight_cost: 1.0,
+            weight_kv_transfer: 1.0,
+            max_ttft: 50,
+            max_tpot: 100,
+            max_e2e: 500,
+            min_quality: 0.8,
+            max_cost: 0.05,
+            max_failure_probability: 0.1,
+        };
+        let firewall = DecisionFirewall { config };
+
+        let mut candidate = CounterfactualEstimate {
+            backend_id: "b-1".into(),
+            compute_node_id: "c-1".into(),
+            model: "m-1".into(),
+            strategy: "s-1".into(),
+            predicted_ttft: 40,
+            predicted_tpot: 90,
+            predicted_e2e: 300,
+            predicted_cost: 0.02,
+            predicted_failure_probability: 0.05,
+            predicted_kv_transfer: 10,
+            quality_risk: 0.9,
+            confidence: 0.95,
+            feasible: true,
+            rejection_reason: None,
+        };
+
+        let ws = WorldState {
+            schema_version: 1,
+            revision: 1,
+            observed_at: SystemTime::now(),
+            nodes: vec![],
+            backends: vec![],
+            model_states: HashMap::new(),
+            queues: HashMap::new(),
+            kv_states: HashMap::new(),
+            network_states: HashMap::new(),
+            health_states: HashMap::new(),
+        };
+
+        // Should pass
+        assert_eq!(firewall.evaluate_candidate(&candidate, &ws), Ok(()));
+
+        // Modify to violate TTFT
+        candidate.predicted_ttft = 60;
+        assert_eq!(
+            firewall.evaluate_candidate(&candidate, &ws),
+            Err("SLO_VIOLATION_TTFT")
+        );
     }
 }
