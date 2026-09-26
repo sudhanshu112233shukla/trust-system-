@@ -520,8 +520,24 @@ impl<T: Copy> OperationalValue<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CandidateId(pub String);
+
+impl CandidateId {
+    pub fn new(backend_id: &str, compute_node_id: &str, strategy: &str) -> Self {
+        Self(format!("{backend_id}:{compute_node_id}:{strategy}"))
+    }
+}
+
+impl std::fmt::Display for CandidateId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CounterfactualEstimate {
+    pub candidate_id: CandidateId,
     pub backend_id: String,
     pub compute_node_id: String,
     pub model: String,
@@ -538,33 +554,20 @@ pub struct CounterfactualEstimate {
     pub rejection_reason: Option<String>,
 }
 
-/// Indexed counterfactual preserving candidate identity through scoring.
-#[derive(Debug)]
-pub struct IndexedEstimate {
-    pub index: usize,
-    pub estimate: CounterfactualEstimate,
-}
-
 pub struct CounterfactualEngine;
 
 impl CounterfactualEngine {
-    /// Evaluate multiple candidates. Identity is preserved via index, not value equality.
-    pub fn evaluate(candidates: Vec<CounterfactualEstimate>) -> Vec<IndexedEstimate> {
-        let mut indexed: Vec<IndexedEstimate> = candidates
-            .into_iter()
-            .enumerate()
-            .filter(|(_, c)| c.feasible)
-            .map(|(index, estimate)| IndexedEstimate { index, estimate })
-            .collect();
-        // Deterministic sort: lower score = better. Ties broken by index.
-        indexed.sort_by(|a, b| {
-            score(&a.estimate)
-                .total_cmp(&score(&b.estimate))
-                .then_with(|| a.estimate.backend_id.cmp(&b.estimate.backend_id))
-                .then_with(|| a.estimate.compute_node_id.cmp(&b.estimate.compute_node_id))
-                .then_with(|| a.index.cmp(&b.index))
+    /// Evaluate multiple candidates deterministically based on CandidateId and score.
+    pub fn evaluate(candidates: Vec<CounterfactualEstimate>) -> Vec<CounterfactualEstimate> {
+        let mut feasible_candidates: Vec<CounterfactualEstimate> =
+            candidates.into_iter().filter(|c| c.feasible).collect();
+        // Deterministic sort: lower score = better. Ties broken by stable candidate_id.
+        feasible_candidates.sort_by(|a, b| {
+            score(a)
+                .total_cmp(&score(b))
+                .then_with(|| a.candidate_id.cmp(&b.candidate_id))
         });
-        indexed
+        feasible_candidates
     }
 
     /// Identify when top candidates are statistically indistinguishable.
@@ -670,42 +673,42 @@ impl DecisionFirewall {
         if candidate
             .predicted_ttft
             .value()
-            .map_or(false, |v| v > self.config.max_ttft)
+            .is_some_and(|v| v > self.config.max_ttft)
         {
             return FirewallDecision::Rejected("SLO_VIOLATION_TTFT");
         }
         if candidate
             .predicted_tpot
             .value()
-            .map_or(false, |v| v > self.config.max_tpot)
+            .is_some_and(|v| v > self.config.max_tpot)
         {
             return FirewallDecision::Rejected("SLO_VIOLATION_TPOT");
         }
         if candidate
             .predicted_e2e
             .value()
-            .map_or(false, |v| v > self.config.max_e2e)
+            .is_some_and(|v| v > self.config.max_e2e)
         {
             return FirewallDecision::Rejected("SLO_VIOLATION_E2E");
         }
         if candidate
             .quality_risk
             .value()
-            .map_or(true, |v| v < self.config.min_quality)
+            .is_none_or(|v| v < self.config.min_quality)
         {
             return FirewallDecision::Rejected("SLO_VIOLATION_QUALITY");
         }
         if candidate
             .predicted_cost
             .value()
-            .map_or(false, |v| v > self.config.max_cost)
+            .is_some_and(|v| v > self.config.max_cost)
         {
             return FirewallDecision::Rejected("SLO_VIOLATION_COST");
         }
         if candidate
             .predicted_failure_probability
             .value()
-            .map_or(false, |v| v > self.config.max_failure_probability)
+            .is_some_and(|v| v > self.config.max_failure_probability)
         {
             return FirewallDecision::Rejected("SLO_VIOLATION_RELIABILITY");
         }
@@ -811,6 +814,7 @@ mod tests {
 
     fn sample_candidate() -> CounterfactualEstimate {
         CounterfactualEstimate {
+            candidate_id: CandidateId::new("b-1", "c-1", "prefill-decode"),
             backend_id: "b-1".into(),
             compute_node_id: "c-1".into(),
             model: "m-1".into(),
@@ -1117,17 +1121,19 @@ mod tests {
     #[test]
     fn counterfactual_preserves_candidate_identity() {
         let c1 = CounterfactualEstimate {
+            candidate_id: CandidateId::new("b-1", "c-1", "prefill-decode"),
             predicted_e2e: OperationalValue::Predicted(100),
             ..sample_candidate()
         };
         let c2 = CounterfactualEstimate {
+            candidate_id: CandidateId::new("b-2", "c-1", "prefill-decode"),
             predicted_e2e: OperationalValue::Predicted(200),
             backend_id: "b-2".into(),
             ..sample_candidate()
         };
         let results = CounterfactualEngine::evaluate(vec![c1, c2]);
-        assert_eq!(results[0].index, 0); // c1 is better
-        assert_eq!(results[1].index, 1);
+        assert_eq!(results[0].backend_id, "b-1"); // c1 is better
+        assert_eq!(results[1].backend_id, "b-2");
     }
 
     #[test]
@@ -1141,20 +1147,22 @@ mod tests {
     #[test]
     fn counterfactual_deterministic_ordering() {
         let c1 = CounterfactualEstimate {
+            candidate_id: CandidateId::new("b-1", "c-1", "prefill-decode"),
             predicted_e2e: OperationalValue::Predicted(200),
             backend_id: "b-1".into(),
             ..sample_candidate()
         };
         let c2 = CounterfactualEstimate {
+            candidate_id: CandidateId::new("b-2", "c-1", "prefill-decode"),
             predicted_e2e: OperationalValue::Predicted(200),
             backend_id: "b-2".into(),
             ..sample_candidate()
         };
         let r1 = CounterfactualEngine::evaluate(vec![c1.clone(), c2.clone()]);
         let r2 = CounterfactualEngine::evaluate(vec![c2, c1]);
-        // Same candidates, different input order, but identity preserved
-        assert_eq!(r1[0].index, 0);
-        assert_eq!(r2[0].index, 1); // c1 was index 1 in second call
+        // Same candidates, different input order, but identity and ranking preserved deterministically
+        assert_eq!(r1[0].backend_id, "b-1");
+        assert_eq!(r2[0].backend_id, "b-1");
     }
 
     #[test]

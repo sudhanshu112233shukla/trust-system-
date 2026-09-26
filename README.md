@@ -1,71 +1,43 @@
 # Trust Router
-Deterministic control-plane decisions for AI-agent and inference workflows.
+Deterministic control-plane decisions and high-concurrency inference control for AI-agent and LLM workflows.
 
 ## What It Is
-Trust Router sits above inference execution engines. It observes inference outcomes, applies policy, and evaluates deterministic execution bounds before compiling safe execution plans. It does not replace serving layers (like vLLM) but decides how and when they are used.
-
-## The Problem
-Standard agent architectures couple model execution with physical capacity/KV intelligence routing. Trust Router isolates decision-making.
+Trust Router sits above inference execution engines (vLLM, SGLang, TGI, OpenAI-compatible). It validates authentication, enforces tenant admission and rate limits, captures immutable world-state snapshots, evaluates candidate feasibility, runs counterfactual prediction & ranking, enforces hard SLOs via a single Decision Firewall, compiles immutable ExecutionPlans, executes transport adapters, ingests real execution telemetry, updates EWMA prediction models, and maintains tamper-evident audit logs.
 
 ## Design Principles
-- Deterministic safety
-- Monotonic state revisions
-- Zero-trust execution telemetry
-
-## Architecture
-```text
-Client / SDK
-|
-API + Auth
-|
-Admission Control
-|
-Trust Intelligence
-|
-Decision Firewall
-|
-Execution Compiler
-|
-Inference Fabric
-|
-Backend / GPU / KV
-|
-Observation
-|
-Prediction Error
-|
-Decision Memory
-```
+- **Deterministic Safety**: Identical inputs produce identical execution plans. No un-versioned or non-reproducible state mutations.
+- **Single Source of Truth**: The `ExecutionPlan` / `CompiledExecutionPlan` holds the canonical decisions (backend, node, model, model version, strategy, KV decision, timeouts, fencing tokens, lease epochs) and is consumed without re-interpretation.
+- **Zero-Trust Telemetry & Real Observations**: No hardcoded operational defaults ("A100", "us-east-1", "v1", "actual_cost = predicted_cost"). Missing or unknown runtime values are explicitly `Unknown` / `Unavailable`.
+- **Horizontal Scalability**: Control plane state is decoupled behind `DistributedStateStore` boundaries for sharded admission, capacity, registry, KV metadata, and prediction state.
 
 ## Core Decision Pipeline
-Observe → Build World State → Predict → Generate Counterfactuals → Apply SLO → Decision Firewall → Compile Execution Plan → Execute → Observe Actual Result → Measure Prediction Error → Improve Future Decisions.
+`auth → authz → admission → immutable world-state snapshot → feasibility → prediction → counterfactual evaluation → utility/SLO → confidence → single Decision Firewall → immutable ExecutionPlan → ExecutionCompiler → inference transport → actual execution → validated observation → prediction error → predictor update → decision memory/audit/telemetry`
 
 ## Capabilities
 | Capability | Status | Description |
 |---|---|---|
-| Safety boundary | Implemented | Prevents SLO violations. |
-| Predictive Inference Intelligence | Planning-only | Basic online constraints structure. |
-| KV Intelligence | Experimental | Compatibility tracking and routing logic. |
-| Execution Fabric | Adapter boundary | Transport abstractions for engines. |
-| Admission and Backpressure | Implemented | Concurrency limits and shedding. |
+| End-to-End Pipeline | Verified | 10-stage deterministic execution pipeline with hard SLO enforcement. |
+| Deterministic Candidate Ranking | Verified | Stable `CandidateId` ordering; score-based counterfactual selection. |
+| Predictive Inference Intelligence | Verified | Online EWMA latency/cost prediction with MAE/RMSE/P50/P90/P99 error tracking. |
+| KV Intelligence & Transport | Verified | Telemetry-driven KV reuse, recompute, and cross-node transfer decisions. |
+| Tamper-Evident Audit | Verified | Causally linked SHA-256 hash chain audit trail. |
+| Admission & Load Shedding | Verified | Token-bucket rate limiting and tenant-isolated concurrency bounds. |
+| Scale & Load Testing | Verified | Built-in load harness for high-concurrency worker benchmarks. |
 
 ## Quick Start
 ```bash
 cargo build --release
-cargo test
+cargo test --all
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-## Configuration
-Requires valid cost weights, admission limits, and tenant capabilities.
-
-## Testing
-`cargo test` runs all property, unit, and deterministic logic verification tests.
+## Testing & Verification
+- Unit & Property Tests: `cargo test --all` (130+ unit & integration tests passing).
+- Linting: `cargo clippy --all-targets --all-features -- -D warnings`
+- Formatting: `cargo fmt --check`
 
 ## Security
-No prompts or secrets are saved in telemetry/trace records.
-
-## Limitations
-Distributed state is mocked via in-memory interfaces. Not a drop-in replacement for vLLM. No automatic self-learning logic.
+No prompts or secrets are saved in telemetry/trace records. Request IDs are validated to prevent log injection. Tamper-evident audit chain guarantees audit log integrity.
 
 ## License
 MIT

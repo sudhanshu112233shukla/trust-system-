@@ -129,6 +129,17 @@ pub struct TransportResponse {
     pub success: bool,
     pub latency_ms: u64,
     pub failure_class: Option<String>,
+    pub ttft_ms: Option<u64>,
+    pub tpot_ms: Option<u64>,
+    pub queue_delay_ms: Option<u64>,
+    pub gpu_utilization: Option<f64>,
+    pub gpu_memory_used_mb: Option<u64>,
+    pub gpu_memory_total_mb: Option<u64>,
+    pub actual_cost: Option<f64>,
+    pub quality_score: Option<f64>,
+    pub accelerator: Option<String>,
+    pub region: Option<String>,
+    pub backend_version: Option<String>,
 }
 
 /// Abstraction over vLLM, OpenAI-compatible, or custom inference endpoints.
@@ -157,6 +168,17 @@ impl InferenceTransport for DeterministicTransport {
             success: true,
             latency_ms: self.latency_ms,
             failure_class: None,
+            ttft_ms: Some(self.latency_ms / 4),
+            tpot_ms: Some(self.latency_ms / 20),
+            queue_delay_ms: Some(1),
+            gpu_utilization: Some(0.5),
+            gpu_memory_used_mb: Some(4000),
+            gpu_memory_total_mb: Some(80000),
+            actual_cost: Some(0.002),
+            quality_score: Some(1.0),
+            accelerator: None,
+            region: None,
+            backend_version: None,
         })
     }
     fn health(&self) -> bool {
@@ -565,7 +587,7 @@ impl NodeLifecycle {
 // Distributed state: Epoch, Lease, FencingToken
 // =========================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Epoch(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -590,6 +612,7 @@ pub trait LeaseStore: Send + Sync {
     fn current_epoch(&self) -> Epoch;
 }
 
+#[derive(Default)]
 pub struct InMemoryLeaseStore {
     current_lease: Option<Lease>,
     epoch: Epoch,
@@ -597,20 +620,18 @@ pub struct InMemoryLeaseStore {
 
 impl InMemoryLeaseStore {
     pub fn new() -> Self {
-        Self {
-            current_lease: None,
-            epoch: Epoch(0),
-        }
+        Self::default()
     }
 }
 
 impl LeaseStore for InMemoryLeaseStore {
     fn acquire(&mut self, owner: &str, ttl: Duration) -> Option<Lease> {
         let now = SystemTime::now();
-        if let Some(lease) = &self.current_lease {
-            if lease.is_valid(now) && lease.owner != owner {
-                return None;
-            }
+        if let Some(lease) = &self.current_lease
+            && lease.is_valid(now)
+            && lease.owner != owner
+        {
+            return None;
         }
         self.epoch.0 += 1;
         let new_lease = Lease {
@@ -804,6 +825,7 @@ pub struct ExecutionCompiler;
 impl ExecutionCompiler {
     pub fn compile(
         candidate: &CounterfactualEstimate,
+        model_version: &str,
         kv_decision: (KvAction, &str),
         quality_floor: f64,
         world_revision: u64,
@@ -813,7 +835,7 @@ impl ExecutionCompiler {
         CompiledExecutionPlan {
             schema_version: 2,
             model: candidate.model.clone(),
-            model_version: "v1".to_string(),
+            model_version: model_version.to_string(),
             backend: candidate.backend_id.clone(),
             node: candidate.compute_node_id.clone(),
             execution_phase: ExecutionPhase::PrefillDecode,
@@ -896,10 +918,10 @@ impl AuditChain {
             if record.current_hash != expected {
                 return Err("TAMPERED_RECORD");
             }
-            if let Some(next) = iter.peek() {
-                if next.previous_hash != record.current_hash {
-                    return Err("BROKEN_CHAIN");
-                }
+            if let Some(next) = iter.peek()
+                && next.previous_hash != record.current_hash
+            {
+                return Err("BROKEN_CHAIN");
             }
         }
         Ok(())
@@ -1356,6 +1378,11 @@ mod tests {
     #[test]
     fn execution_compiler_produces_valid_plan() {
         let candidate = CounterfactualEstimate {
+            candidate_id: crate::intelligence::CandidateId::new(
+                "gpu-0",
+                "node-1",
+                "prefill-decode",
+            ),
             backend_id: "gpu-0".into(),
             compute_node_id: "node-1".into(),
             model: "llama-3".into(),
@@ -1372,7 +1399,7 @@ mod tests {
             rejection_reason: None,
         };
         let kv_decision = (KvAction::Transfer, "TRANSFER_BENEFICIAL");
-        let plan = ExecutionCompiler::compile(&candidate, kv_decision, 0.8, 42, 3, 7);
+        let plan = ExecutionCompiler::compile(&candidate, "v1", kv_decision, 0.8, 42, 3, 7);
         assert_eq!(plan.schema_version, 2);
         assert_eq!(plan.model, "llama-3");
         assert_eq!(plan.backend, "gpu-0");

@@ -51,6 +51,7 @@ pub struct PipelineRequest {
     pub observed_transfer_latency_ms: Option<u64>,
     pub observed_network_cost: Option<f64>,
     pub observed_recomputation_ms: Option<u64>,
+    pub observed_source_node: Option<String>,
 }
 
 impl PipelineRequest {
@@ -77,6 +78,7 @@ impl PipelineRequest {
             observed_transfer_latency_ms: None,
             observed_network_cost: None,
             observed_recomputation_ms: None,
+            observed_source_node: None,
         }
     }
 }
@@ -188,25 +190,25 @@ impl PipelineEngine {
             };
 
         // Stage 1: Authentication & Authorization
-        if let Some(ref api_key) = req.api_key {
-            if api_key == "invalid" || api_key.is_empty() {
-                let trace = trace_finish(false, "Authentication failed", trace_rejected);
-                return PipelineOutcome {
-                    success: false,
-                    request_id: req.request_id.clone(),
-                    decision_id,
-                    selected_backend: None,
-                    selected_node: None,
-                    selected_strategy: None,
-                    selected_kv_action: None,
-                    execution_plan: None,
-                    compiled_plan: None,
-                    execution_result: None,
-                    rejection_reason: Some("Authentication failed".into()),
-                    trace,
-                    world_revision: 0,
-                };
-            }
+        if let Some(ref api_key) = req.api_key
+            && (api_key == "invalid" || api_key.is_empty())
+        {
+            let trace = trace_finish(false, "Authentication failed", trace_rejected);
+            return PipelineOutcome {
+                success: false,
+                request_id: req.request_id.clone(),
+                decision_id,
+                selected_backend: None,
+                selected_node: None,
+                selected_strategy: None,
+                selected_kv_action: None,
+                execution_plan: None,
+                compiled_plan: None,
+                execution_result: None,
+                rejection_reason: Some("Authentication failed".into()),
+                trace,
+                world_revision: 0,
+            };
         }
 
         // Stage 2: Admission & Rate Limits
@@ -373,13 +375,19 @@ impl PipelineEngine {
                         .map(|p| crate::intelligence::OperationalValue::Predicted(p.value as u64))
                         .unwrap_or(crate::intelligence::OperationalValue::Unavailable);
 
+                    let candidate_id = crate::intelligence::CandidateId::new(
+                        decl_id,
+                        &node.id,
+                        &format!("{:?}", strategy),
+                    );
                     let estimate = CounterfactualEstimate {
+                        candidate_id,
                         backend_id: decl_id.to_string(),
                         compute_node_id: node.id.clone(),
                         model: req.model.clone(),
                         strategy: format!("{:?}", strategy),
                         predicted_ttft,
-                        predicted_tpot: crate::intelligence::OperationalValue::Unavailable, // Not predicted yet
+                        predicted_tpot: crate::intelligence::OperationalValue::Unavailable,
                         predicted_e2e,
                         predicted_cost: crate::intelligence::OperationalValue::Derived(0.005),
                         predicted_failure_probability:
@@ -396,68 +404,57 @@ impl PipelineEngine {
             }
         }
 
-        // Deterministic candidate sorting: (backend_id, compute_node_id, strategy)
-        raw_candidates.sort_by(|a, b| {
-            a.0.backend_id
-                .cmp(&b.0.backend_id)
-                .then_with(|| a.0.compute_node_id.cmp(&b.0.compute_node_id))
-                .then_with(|| a.0.strategy.cmp(&b.0.strategy))
-        });
+        // Deterministic candidate sorting by CandidateId
+        raw_candidates.sort_by(|a, b| a.0.candidate_id.cmp(&b.0.candidate_id));
 
         // Stage 6: Hard Constraints & Decision Firewall
         let mut valid_candidates = Vec::new();
         for (candidate, kv_action) in raw_candidates {
             // Hard constraint checks
-            if let Some(max_ttft) = req.max_ttft_ms {
-                if candidate
+            if let Some(max_ttft) = req.max_ttft_ms
+                && candidate
                     .predicted_ttft
                     .value()
-                    .map_or(false, |v| v > max_ttft)
-                {
-                    trace_rejected.push(TraceRejection {
-                        backend_id: candidate.backend_id.clone(),
-                        compute_node_id: candidate.compute_node_id.clone(),
-                        reason: format!(
-                            "TTFT {:?} exceeds max {}ms",
-                            candidate.predicted_ttft, max_ttft
-                        ),
-                    });
-                    continue;
-                }
+                    .is_some_and(|v| v > max_ttft)
+            {
+                trace_rejected.push(TraceRejection {
+                    backend_id: candidate.backend_id.clone(),
+                    compute_node_id: candidate.compute_node_id.clone(),
+                    reason: format!(
+                        "TTFT {:?} exceeds max {}ms",
+                        candidate.predicted_ttft, max_ttft
+                    ),
+                });
+                continue;
             }
-            if let Some(max_e2e) = req.max_e2e_ms {
-                if candidate
-                    .predicted_e2e
-                    .value()
-                    .map_or(false, |v| v > max_e2e)
-                {
-                    trace_rejected.push(TraceRejection {
-                        backend_id: candidate.backend_id.clone(),
-                        compute_node_id: candidate.compute_node_id.clone(),
-                        reason: format!(
-                            "E2E {:?} exceeds max {}ms",
-                            candidate.predicted_e2e, max_e2e
-                        ),
-                    });
-                    continue;
-                }
+            if let Some(max_e2e) = req.max_e2e_ms
+                && candidate.predicted_e2e.value().is_some_and(|v| v > max_e2e)
+            {
+                trace_rejected.push(TraceRejection {
+                    backend_id: candidate.backend_id.clone(),
+                    compute_node_id: candidate.compute_node_id.clone(),
+                    reason: format!(
+                        "E2E {:?} exceeds max {}ms",
+                        candidate.predicted_e2e, max_e2e
+                    ),
+                });
+                continue;
             }
-            if let Some(max_cost) = req.max_cost {
-                if candidate
+            if let Some(max_cost) = req.max_cost
+                && candidate
                     .predicted_cost
                     .value()
-                    .map_or(false, |v| v > max_cost)
-                {
-                    trace_rejected.push(TraceRejection {
-                        backend_id: candidate.backend_id.clone(),
-                        compute_node_id: candidate.compute_node_id.clone(),
-                        reason: format!(
-                            "Cost {:?} exceeds max {}",
-                            candidate.predicted_cost, max_cost
-                        ),
-                    });
-                    continue;
-                }
+                    .is_some_and(|v| v > max_cost)
+            {
+                trace_rejected.push(TraceRejection {
+                    backend_id: candidate.backend_id.clone(),
+                    compute_node_id: candidate.compute_node_id.clone(),
+                    reason: format!(
+                        "Cost {:?} exceeds max {}",
+                        candidate.predicted_cost, max_cost
+                    ),
+                });
+                continue;
             }
 
             // Firewall Evaluation
@@ -508,8 +505,12 @@ impl PipelineEngine {
             .collect::<Vec<_>>();
         let evaluated = CounterfactualEngine::evaluate(estimates);
 
-        let top_index = evaluated[0].index;
-        let (selected_candidate, selected_kv) = &valid_candidates[top_index];
+        let selected_candidate = evaluated[0].clone();
+        let selected_kv = valid_candidates
+            .iter()
+            .find(|(c, _)| c.candidate_id == selected_candidate.candidate_id)
+            .map(|(_, kv)| *kv)
+            .unwrap_or(KvAction::Recompute);
 
         // Stage 8: Canonical ExecutionPlan & Compilation
         let plan = ExecutionPlan {
@@ -518,7 +519,7 @@ impl PipelineEngine {
                 tenant_id: req.tenant_id.clone(),
                 start: selected_candidate.compute_node_id.clone(),
                 goal: selected_candidate.compute_node_id.clone(),
-                cache_hit: *selected_kv == KvAction::Reuse,
+                cache_hit: selected_kv == KvAction::Reuse,
             },
             candidate: Candidate {
                 nodes: vec![selected_candidate.compute_node_id.clone()],
@@ -540,9 +541,11 @@ impl PipelineEngine {
             },
         };
 
+        let req_model_version = req.model_version.as_deref().unwrap_or("Unknown");
         let compiled = ExecutionCompiler::compile(
-            selected_candidate,
-            (*selected_kv, "Selected deterministic action"),
+            &selected_candidate,
+            req_model_version,
+            (selected_kv, "Selected deterministic action"),
             0.8,
             world_snapshot.revision,
             1,
@@ -553,37 +556,40 @@ impl PipelineEngine {
         let transport_req = TransportRequest {
             request_id: req.request_id.clone(),
             model: req.model.clone(),
-            model_version: req.model_version.clone().unwrap_or_else(|| "v1".into()),
+            model_version: req
+                .model_version
+                .clone()
+                .unwrap_or_else(|| "Unknown".into()),
             backend_id: selected_candidate.backend_id.clone(),
             timeout: compiled.timeout,
         };
 
         // Execute KV Transfer if required
-        if *selected_kv == KvAction::Transfer {
-            if let Some(kv_tp) = kv_transport {
-                if let Err(err) = kv_tp.transfer("source-node", &selected_candidate.compute_node_id)
-                {
-                    let trace = trace_finish(
-                        false,
-                        &format!("KV Transfer failed: {err:?}"),
-                        trace_rejected,
-                    );
-                    return PipelineOutcome {
-                        success: false,
-                        request_id: req.request_id.clone(),
-                        decision_id,
-                        selected_backend: Some(selected_candidate.backend_id.clone()),
-                        selected_node: Some(selected_candidate.compute_node_id.clone()),
-                        selected_strategy: Some(selected_candidate.strategy.clone()),
-                        selected_kv_action: Some(*selected_kv),
-                        execution_plan: Some(plan),
-                        compiled_plan: Some(compiled),
-                        execution_result: None,
-                        rejection_reason: Some(format!("KV Transfer failed: {err}")),
-                        trace,
-                        world_revision: world_snapshot.revision,
-                    };
-                }
+        if selected_kv == KvAction::Transfer
+            && let Some(kv_tp) = kv_transport
+        {
+            let source_node = req.observed_source_node.as_deref().unwrap_or("Unknown");
+            if let Err(err) = kv_tp.transfer(source_node, &selected_candidate.compute_node_id) {
+                let trace = trace_finish(
+                    false,
+                    &format!("KV Transfer failed: {err:?}"),
+                    trace_rejected,
+                );
+                return PipelineOutcome {
+                    success: false,
+                    request_id: req.request_id.clone(),
+                    decision_id,
+                    selected_backend: Some(selected_candidate.backend_id.clone()),
+                    selected_node: Some(selected_candidate.compute_node_id.clone()),
+                    selected_strategy: Some(selected_candidate.strategy.clone()),
+                    selected_kv_action: Some(selected_kv),
+                    execution_plan: Some(plan),
+                    compiled_plan: Some(compiled),
+                    execution_result: None,
+                    rejection_reason: Some(format!("KV Transfer failed: {err}")),
+                    trace,
+                    world_revision: world_snapshot.revision,
+                };
             }
         }
 
@@ -602,7 +608,7 @@ impl PipelineEngine {
                     selected_backend: Some(selected_candidate.backend_id.clone()),
                     selected_node: Some(selected_candidate.compute_node_id.clone()),
                     selected_strategy: Some(selected_candidate.strategy.clone()),
-                    selected_kv_action: Some(*selected_kv),
+                    selected_kv_action: Some(selected_kv),
                     execution_plan: Some(plan),
                     compiled_plan: Some(compiled),
                     execution_result: None,
@@ -634,32 +640,48 @@ impl PipelineEngine {
             request_id: req.request_id.clone(),
             tenant: req.tenant_id.clone(),
             model: req.model.clone(),
-            model_version: req.model_version.clone().unwrap_or_else(|| "v1".into()),
+            model_version: req
+                .model_version
+                .clone()
+                .unwrap_or_else(|| "Unknown".into()),
             backend_id: selected_candidate.backend_id.clone(),
-            backend_version: "1.0.0".into(),
+            backend_version: transport_resp
+                .backend_version
+                .clone()
+                .unwrap_or_else(|| "Unknown".into()),
             compute_node_id: selected_candidate.compute_node_id.clone(),
-            accelerator: "A100".into(),
-            region: "us-east-1".into(),
+            accelerator: transport_resp
+                .accelerator
+                .clone()
+                .unwrap_or_else(|| "Unknown".into()),
+            region: transport_resp
+                .region
+                .clone()
+                .unwrap_or_else(|| "Unknown".into()),
             prefill_tokens: req.prompt_tokens as u64,
             decode_tokens: req.max_tokens as u64,
             total_tokens: (req.prompt_tokens + req.max_tokens) as u64,
-            queue_delay_ms: 2,
-            ttft_ms: selected_candidate.predicted_ttft.value().unwrap_or(0),
-            tpot_ms: 10,
+            queue_delay_ms: transport_resp.queue_delay_ms.unwrap_or(0),
+            ttft_ms: transport_resp.ttft_ms.unwrap_or(0),
+            tpot_ms: transport_resp.tpot_ms.unwrap_or(0),
             e2e_latency_ms: transport_resp.latency_ms,
-            gpu_utilization: 0.75,
-            gpu_memory_used_mb: 500,
-            gpu_memory_total_mb: 80000,
-            kv_hit: *selected_kv == KvAction::Reuse,
-            kv_tokens: req.prompt_tokens as u64,
-            kv_memory_mb: 100,
-            kv_transfer_ms: 0,
+            gpu_utilization: transport_resp.gpu_utilization.unwrap_or(0.0),
+            gpu_memory_used_mb: transport_resp.gpu_memory_used_mb.unwrap_or(0),
+            gpu_memory_total_mb: transport_resp.gpu_memory_total_mb.unwrap_or(0),
+            kv_hit: selected_kv == KvAction::Reuse,
+            kv_tokens: if selected_kv == KvAction::Reuse {
+                req.prompt_tokens as u64
+            } else {
+                0
+            },
+            kv_memory_mb: req.observed_kv_size_mb.unwrap_or(0),
+            kv_transfer_ms: req.observed_transfer_latency_ms.unwrap_or(0),
             network_transfer_ms: 0,
             retries: 0,
             failure_class: transport_resp.failure_class.clone(),
-            quality_score: 1.0,
+            quality_score: transport_resp.quality_score.unwrap_or(1.0),
             estimated_cost: selected_candidate.predicted_cost.value().unwrap_or(0.0),
-            actual_cost: selected_candidate.predicted_cost.value().unwrap_or(0.0),
+            actual_cost: transport_resp.actual_cost.unwrap_or(0.0),
             timestamp: SystemTime::now(),
             world_revision: world_snapshot.revision,
         };
@@ -688,7 +710,7 @@ impl PipelineEngine {
             selected_backend: Some(selected_candidate.backend_id.clone()),
             selected_node: Some(selected_candidate.compute_node_id.clone()),
             selected_strategy: Some(selected_candidate.strategy.clone()),
-            selected_kv_action: Some(*selected_kv),
+            selected_kv_action: Some(selected_kv),
             execution_plan: Some(plan),
             compiled_plan: Some(compiled),
             execution_result: Some(exec_result),
@@ -801,6 +823,6 @@ mod tests {
         assert_eq!(outcome.selected_backend.unwrap(), "backend-1");
         assert_eq!(outcome.selected_node.unwrap(), "node-1");
         assert!(outcome.execution_result.is_some());
-        assert_eq!(outcome.execution_result.unwrap().success, true);
+        assert!(outcome.execution_result.unwrap().success);
     }
 }
