@@ -8,9 +8,78 @@
 
 use crate::intelligence::CounterfactualEstimate;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
+
+// =========================================================================
+// Distributed State Boundary
+// =========================================================================
+
+pub trait DistributedStateStore: Send + Sync {
+    fn fetch_capacity<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<crate::capacity::CapacitySnapshot, crate::fabric::FabricError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+    fn fetch_registry<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        crate::backend_registry::BackendRegistry,
+                        crate::fabric::FabricError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+}
+
+pub struct LocalStateStore {
+    pub capacity: std::sync::Arc<std::sync::RwLock<crate::capacity::CapacitySnapshot>>,
+    pub registry: std::sync::Arc<std::sync::RwLock<crate::backend_registry::BackendRegistry>>,
+}
+
+impl DistributedStateStore for LocalStateStore {
+    fn fetch_capacity<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<crate::capacity::CapacitySnapshot, crate::fabric::FabricError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let cap = self.capacity.read().unwrap().clone();
+        Box::pin(async move { Ok(cap) })
+    }
+    fn fetch_registry<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        crate::backend_registry::BackendRegistry,
+                        crate::fabric::FabricError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let reg = self.registry.read().unwrap().clone();
+        Box::pin(async move { Ok(reg) })
+    }
+}
 
 // =========================================================================
 // Error types
@@ -612,9 +681,7 @@ pub struct RuntimeBackendState {
 
 impl RuntimeBackendState {
     pub fn is_selectable(&self) -> bool {
-        matches!(self.readiness, BackendReadiness::Ready)
-            && self.model_loaded
-            && self.health_ok
+        matches!(self.readiness, BackendReadiness::Ready) && self.model_loaded && self.health_ok
     }
 
     pub fn is_stale(&self, max_age: Duration) -> bool {
@@ -824,11 +891,8 @@ impl AuditChain {
     pub fn verify_integrity(&self) -> Result<(), &'static str> {
         let mut iter = self.records.iter().peekable();
         while let Some(record) = iter.next() {
-            let expected = AuditRecord::compute_hash(
-                &record.event_id,
-                &record.previous_hash,
-                &record.actor,
-            );
+            let expected =
+                AuditRecord::compute_hash(&record.event_id, &record.previous_hash, &record.actor);
             if record.current_hash != expected {
                 return Err("TAMPERED_RECORD");
             }
@@ -1110,9 +1174,11 @@ mod tests {
         assert!(store.verify(lease1.epoch));
 
         // Leader B cannot acquire while A is valid
-        assert!(store
-            .acquire("leader_b", Duration::from_millis(100))
-            .is_none());
+        assert!(
+            store
+                .acquire("leader_b", Duration::from_millis(100))
+                .is_none()
+        );
 
         // Wait for expiry
         std::thread::sleep(Duration::from_millis(150));
@@ -1294,14 +1360,14 @@ mod tests {
             compute_node_id: "node-1".into(),
             model: "llama-3".into(),
             strategy: "prefill-decode".into(),
-            predicted_ttft: 30,
-            predicted_tpot: 50,
-            predicted_e2e: 200,
-            predicted_cost: 0.01,
-            predicted_failure_probability: 0.02,
-            predicted_kv_transfer: 5,
-            quality_risk: 0.95,
-            confidence: 0.9,
+            predicted_ttft: crate::intelligence::OperationalValue::Predicted(30),
+            predicted_tpot: crate::intelligence::OperationalValue::Predicted(50),
+            predicted_e2e: crate::intelligence::OperationalValue::Predicted(200),
+            predicted_cost: crate::intelligence::OperationalValue::Derived(0.01),
+            predicted_failure_probability: crate::intelligence::OperationalValue::Predicted(0.02),
+            predicted_kv_transfer: crate::intelligence::OperationalValue::Predicted(5),
+            quality_risk: crate::intelligence::OperationalValue::Configured(0.95),
+            confidence: crate::intelligence::OperationalValue::Derived(0.9),
             feasible: true,
             rejection_reason: None,
         };

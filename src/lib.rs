@@ -12,11 +12,11 @@ pub mod health_monitor;
 pub mod inference;
 pub mod intelligence;
 pub mod kv;
+pub mod pipeline;
 pub mod planner;
 pub mod sidecar_config;
 pub mod sidecar_security;
 pub mod system_planning;
-pub mod pipeline;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};

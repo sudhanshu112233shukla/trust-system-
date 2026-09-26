@@ -8,8 +8,7 @@
 
 use crate::admission::AdmissionController;
 use crate::backend::BackendResult as ExecutionResult;
-use crate::backend_registry::BackendRegistry;
-use crate::capacity::{CapacityRequirement, CapacitySnapshot};
+use crate::capacity::CapacityRequirement;
 use crate::control_plane::{ControlPlaneSnapshot, ControlPlaneVersions};
 use crate::decision_trace::{DecisionTrace, TraceRejection};
 use crate::fabric::{
@@ -48,6 +47,10 @@ pub struct PipelineRequest {
     pub min_quality: Option<f64>,
     pub max_cost: Option<f64>,
     pub force_stale_world_state: bool,
+    pub observed_kv_size_mb: Option<u64>,
+    pub observed_transfer_latency_ms: Option<u64>,
+    pub observed_network_cost: Option<f64>,
+    pub observed_recomputation_ms: Option<u64>,
 }
 
 impl PipelineRequest {
@@ -70,6 +73,10 @@ impl PipelineRequest {
             min_quality: Some(0.8),
             max_cost: Some(0.05),
             force_stale_world_state: false,
+            observed_kv_size_mb: None,
+            observed_transfer_latency_ms: None,
+            observed_network_cost: None,
+            observed_recomputation_ms: None,
         }
     }
 }
@@ -97,9 +104,8 @@ pub struct PipelineOutcome {
 // =========================================================================
 
 pub struct PipelineEngine {
+    pub state_store: Arc<dyn crate::fabric::DistributedStateStore>,
     pub world_state_manager: WorldStateManager,
-    pub backend_registry: Arc<RwLock<BackendRegistry>>,
-    pub capacity: Arc<RwLock<CapacitySnapshot>>,
     pub control_plane: Arc<RwLock<ControlPlaneSnapshot>>,
     pub kv_intelligence: Arc<RwLock<KvIntelligence>>,
     pub admission_controller: AdmissionController,
@@ -114,8 +120,7 @@ pub struct PipelineEngine {
 impl PipelineEngine {
     pub fn new(
         world_state_manager: WorldStateManager,
-        backend_registry: BackendRegistry,
-        capacity: CapacitySnapshot,
+        state_store: Arc<dyn crate::fabric::DistributedStateStore>,
         kv_intelligence: KvIntelligence,
     ) -> Self {
         let firewall = DecisionFirewall {
@@ -137,9 +142,8 @@ impl PipelineEngine {
         };
 
         Self {
+            state_store,
             world_state_manager,
-            backend_registry: Arc::new(RwLock::new(backend_registry)),
-            capacity: Arc::new(RwLock::new(capacity)),
             control_plane: Arc::new(RwLock::new(ControlPlaneSnapshot::new(
                 kv_intelligence.clone(),
                 ControlPlaneVersions::default(),
@@ -160,7 +164,7 @@ impl PipelineEngine {
     }
 
     /// Primary entry point: process a request through the full deterministic pipeline.
-    pub fn process_request(
+    pub async fn process_request(
         &self,
         req: &PipelineRequest,
         transport: &dyn InferenceTransport,
@@ -170,17 +174,18 @@ impl PipelineEngine {
 
         let decision_id = format!("dec-{}", req.request_id);
 
-        let trace_finish = |success: bool, reason: &str, rejected: Vec<TraceRejection>| DecisionTrace {
-            schema_version: crate::decision_trace::DECISION_TRACE_SCHEMA_VERSION,
-            request_id: req.request_id.clone(),
-            capacity_revision: 0,
-            backend_revision: 0,
-            selected: None,
-            rejected,
-            rejected_truncated: false,
-            unavailable_nodes: Vec::new(),
-            config_error: if !success { Some(reason.into()) } else { None },
-        };
+        let trace_finish =
+            |success: bool, reason: &str, rejected: Vec<TraceRejection>| DecisionTrace {
+                schema_version: crate::decision_trace::DECISION_TRACE_SCHEMA_VERSION,
+                request_id: req.request_id.clone(),
+                capacity_revision: 0,
+                backend_revision: 0,
+                selected: None,
+                rejected,
+                rejected_truncated: false,
+                unavailable_nodes: Vec::new(),
+                config_error: if !success { Some(reason.into()) } else { None },
+            };
 
         // Stage 1: Authentication & Authorization
         if let Some(ref api_key) = req.api_key {
@@ -210,21 +215,21 @@ impl PipelineEngine {
             Err(err) => {
                 let reason = format!("Admission rejected: {err:?}");
                 let trace = trace_finish(false, &reason, trace_rejected);
-            return PipelineOutcome {
-                success: false,
-                request_id: req.request_id.clone(),
-                decision_id,
-                selected_backend: None,
-                selected_node: None,
-                selected_strategy: None,
-                selected_kv_action: None,
-                execution_plan: None,
-                compiled_plan: None,
-                execution_result: None,
-                rejection_reason: Some(reason),
-                trace,
-                world_revision: 0,
-            };
+                return PipelineOutcome {
+                    success: false,
+                    request_id: req.request_id.clone(),
+                    decision_id,
+                    selected_backend: None,
+                    selected_node: None,
+                    selected_strategy: None,
+                    selected_kv_action: None,
+                    execution_plan: None,
+                    compiled_plan: None,
+                    execution_result: None,
+                    rejection_reason: Some(reason),
+                    trace,
+                    world_revision: 0,
+                };
             }
         };
 
@@ -232,7 +237,8 @@ impl PipelineEngine {
         let world_snapshot = match self.world_state_manager.snapshot() {
             Ok(snap) => {
                 if req.force_stale_world_state {
-                    let trace = trace_finish(false, "Stale world state revision", trace_rejected.clone());
+                    let trace =
+                        trace_finish(false, "Stale world state revision", trace_rejected.clone());
                     return PipelineOutcome {
                         success: false,
                         request_id: req.request_id.clone(),
@@ -252,7 +258,11 @@ impl PipelineEngine {
                 snap
             }
             Err(err) => {
-                let trace = trace_finish(false, &format!("World state error: {err:?}"), trace_rejected);
+                let trace = trace_finish(
+                    false,
+                    &format!("World state error: {err:?}"),
+                    trace_rejected,
+                );
                 return PipelineOutcome {
                     success: false,
                     request_id: req.request_id.clone(),
@@ -271,11 +281,12 @@ impl PipelineEngine {
             }
         };
 
-        let backends = self.backend_registry.read().unwrap();
-        let capacity = self.capacity.read().unwrap();
+        let backends = self.state_store.fetch_registry().await.unwrap_or_default();
+        let capacity = self.state_store.fetch_capacity().await.unwrap_or_default();
         let _kv_reg = self.kv_intelligence.read().unwrap();
-        
-        let model_ref = ModelReference::new(&req.model, req.model_version.as_deref().unwrap_or("1"));
+
+        let model_ref =
+            ModelReference::new(&req.model, req.model_version.as_deref().unwrap_or("1"));
 
         // Stage 4: Candidate Generation & Deterministic Tie-Breaking
         let declared_backends = backends.backend_ids();
@@ -315,22 +326,31 @@ impl PipelineEngine {
                     crate::kv::KvStrategy::CachedKv,
                     crate::kv::KvStrategy::CrossModelKvTransfer,
                 ];
-                let strategies: Vec<_> = all_strategies.iter().copied()
-                    .filter(|s| backends.supports(decl_id, &model_ref, *s).unwrap_or(false)).collect();
+                let strategies: Vec<_> = all_strategies
+                    .iter()
+                    .copied()
+                    .filter(|s| backends.supports(decl_id, &model_ref, *s).unwrap_or(false))
+                    .collect();
                 for strategy in strategies {
                     // Stage 5: KV Intelligence Evaluation
                     let kv_decision = if let Some(ref _prefix) = req.prompt_prefix_hash {
                         let input = KvDecisionInput {
                             compatible: true,
-                            kv_size_mb: 100,
-                            transfer_latency_ms: 10,
-                            network_cost: 0.01,
-                            recomputation_ms: 50,
-                            expected_reuse: 0.8,
-                            failure_risk: 0.01,
+                            kv_size_mb: req.observed_kv_size_mb.unwrap_or(0),
+                            transfer_latency_ms: req
+                                .observed_transfer_latency_ms
+                                .unwrap_or(u64::MAX), // Conservative: high transfer latency
+                            network_cost: req.observed_network_cost.unwrap_or(f64::MAX),
+                            recomputation_ms: req.observed_recomputation_ms.unwrap_or(0),
+                            expected_reuse: 0.8, // Should also be derived from predictor
+                            failure_risk: 0.01,  // Should also be derived
                             confidence: 0.9,
                         };
-                        input.decide()
+                        if input.transfer_latency_ms == u64::MAX || input.network_cost == f64::MAX {
+                            (KvAction::Recompute, "MISSING_KV_TELEMETRY")
+                        } else {
+                            input.decide()
+                        }
                     } else {
                         (KvAction::Recompute, "NO_PREFIX")
                     };
@@ -342,16 +362,16 @@ impl PipelineEngine {
                         .unwrap()
                         .predict(&format!("{}-ttft", decl_id), world_snapshot.revision)
                         .ok()
-                        .map(|p| p.value as u64)
-                        .unwrap_or(50);
+                        .map(|p| crate::intelligence::OperationalValue::Predicted(p.value as u64))
+                        .unwrap_or(crate::intelligence::OperationalValue::Unavailable);
                     let predicted_e2e = self
                         .prediction_engine
                         .read()
                         .unwrap()
                         .predict(&format!("{}-e2e", decl_id), world_snapshot.revision)
                         .ok()
-                        .map(|p| p.value as u64)
-                        .unwrap_or(200);
+                        .map(|p| crate::intelligence::OperationalValue::Predicted(p.value as u64))
+                        .unwrap_or(crate::intelligence::OperationalValue::Unavailable);
 
                     let estimate = CounterfactualEstimate {
                         backend_id: decl_id.to_string(),
@@ -359,13 +379,14 @@ impl PipelineEngine {
                         model: req.model.clone(),
                         strategy: format!("{:?}", strategy),
                         predicted_ttft,
-                        predicted_tpot: 10,
+                        predicted_tpot: crate::intelligence::OperationalValue::Unavailable, // Not predicted yet
                         predicted_e2e,
-                        predicted_cost: 0.005,
-                        predicted_failure_probability: 0.01,
-                        predicted_kv_transfer: 0,
-                        quality_risk: 1.0,
-                        confidence: 0.9,
+                        predicted_cost: crate::intelligence::OperationalValue::Derived(0.005),
+                        predicted_failure_probability:
+                            crate::intelligence::OperationalValue::Predicted(0.01),
+                        predicted_kv_transfer: crate::intelligence::OperationalValue::Unavailable,
+                        quality_risk: crate::intelligence::OperationalValue::Configured(1.0),
+                        confidence: crate::intelligence::OperationalValue::Derived(0.9),
                         feasible: true,
                         rejection_reason: None,
                     };
@@ -388,31 +409,52 @@ impl PipelineEngine {
         for (candidate, kv_action) in raw_candidates {
             // Hard constraint checks
             if let Some(max_ttft) = req.max_ttft_ms {
-                if candidate.predicted_ttft > max_ttft {
+                if candidate
+                    .predicted_ttft
+                    .value()
+                    .map_or(false, |v| v > max_ttft)
+                {
                     trace_rejected.push(TraceRejection {
                         backend_id: candidate.backend_id.clone(),
                         compute_node_id: candidate.compute_node_id.clone(),
-                        reason: format!("TTFT {}ms exceeds max {}ms", candidate.predicted_ttft, max_ttft),
+                        reason: format!(
+                            "TTFT {:?} exceeds max {}ms",
+                            candidate.predicted_ttft, max_ttft
+                        ),
                     });
                     continue;
                 }
             }
             if let Some(max_e2e) = req.max_e2e_ms {
-                if candidate.predicted_e2e > max_e2e {
+                if candidate
+                    .predicted_e2e
+                    .value()
+                    .map_or(false, |v| v > max_e2e)
+                {
                     trace_rejected.push(TraceRejection {
                         backend_id: candidate.backend_id.clone(),
                         compute_node_id: candidate.compute_node_id.clone(),
-                        reason: format!("E2E {}ms exceeds max {}ms", candidate.predicted_e2e, max_e2e),
+                        reason: format!(
+                            "E2E {:?} exceeds max {}ms",
+                            candidate.predicted_e2e, max_e2e
+                        ),
                     });
                     continue;
                 }
             }
             if let Some(max_cost) = req.max_cost {
-                if candidate.predicted_cost > max_cost {
+                if candidate
+                    .predicted_cost
+                    .value()
+                    .map_or(false, |v| v > max_cost)
+                {
                     trace_rejected.push(TraceRejection {
                         backend_id: candidate.backend_id.clone(),
                         compute_node_id: candidate.compute_node_id.clone(),
-                        reason: format!("Cost {} exceeds max {}", candidate.predicted_cost, max_cost),
+                        reason: format!(
+                            "Cost {:?} exceeds max {}",
+                            candidate.predicted_cost, max_cost
+                        ),
                     });
                     continue;
                 }
@@ -435,7 +477,11 @@ impl PipelineEngine {
         }
 
         if valid_candidates.is_empty() {
-            let trace = trace_finish(false, "All candidates rejected by hard constraints/firewall", trace_rejected);
+            let trace = trace_finish(
+                false,
+                "All candidates rejected by hard constraints/firewall",
+                trace_rejected,
+            );
             return PipelineOutcome {
                 success: false,
                 request_id: req.request_id.clone(),
@@ -447,7 +493,9 @@ impl PipelineEngine {
                 execution_plan: None,
                 compiled_plan: None,
                 execution_result: None,
-                rejection_reason: Some("All candidates rejected by hard constraints/firewall".into()),
+                rejection_reason: Some(
+                    "All candidates rejected by hard constraints/firewall".into(),
+                ),
                 trace,
                 world_revision: world_snapshot.revision,
             };
@@ -513,8 +561,13 @@ impl PipelineEngine {
         // Execute KV Transfer if required
         if *selected_kv == KvAction::Transfer {
             if let Some(kv_tp) = kv_transport {
-                if let Err(err) = kv_tp.transfer("source-node", &selected_candidate.compute_node_id) {
-                    let trace = trace_finish(false, &format!("KV Transfer failed: {err:?}"), trace_rejected);
+                if let Err(err) = kv_tp.transfer("source-node", &selected_candidate.compute_node_id)
+                {
+                    let trace = trace_finish(
+                        false,
+                        &format!("KV Transfer failed: {err:?}"),
+                        trace_rejected,
+                    );
                     return PipelineOutcome {
                         success: false,
                         request_id: req.request_id.clone(),
@@ -537,7 +590,11 @@ impl PipelineEngine {
         let transport_resp = match transport.execute(&transport_req) {
             Ok(resp) => resp,
             Err(err) => {
-                let trace = trace_finish(false, &format!("Transport execution failed: {err:?}"), trace_rejected);
+                let trace = trace_finish(
+                    false,
+                    &format!("Transport execution failed: {err:?}"),
+                    trace_rejected,
+                );
                 return PipelineOutcome {
                     success: false,
                     request_id: req.request_id.clone(),
@@ -560,7 +617,7 @@ impl PipelineEngine {
             backend: selected_candidate.backend_id.clone(),
             success: transport_resp.success,
             latency_ms: Some(transport_resp.latency_ms),
-            estimated_cost: Some(selected_candidate.predicted_cost),
+            estimated_cost: selected_candidate.predicted_cost.value(),
             failure: None,
         };
 
@@ -587,7 +644,7 @@ impl PipelineEngine {
             decode_tokens: req.max_tokens as u64,
             total_tokens: (req.prompt_tokens + req.max_tokens) as u64,
             queue_delay_ms: 2,
-            ttft_ms: selected_candidate.predicted_ttft,
+            ttft_ms: selected_candidate.predicted_ttft.value().unwrap_or(0),
             tpot_ms: 10,
             e2e_latency_ms: transport_resp.latency_ms,
             gpu_utilization: 0.75,
@@ -601,8 +658,8 @@ impl PipelineEngine {
             retries: 0,
             failure_class: transport_resp.failure_class.clone(),
             quality_score: 1.0,
-            estimated_cost: selected_candidate.predicted_cost,
-            actual_cost: selected_candidate.predicted_cost,
+            estimated_cost: selected_candidate.predicted_cost.value().unwrap_or(0.0),
+            actual_cost: selected_candidate.predicted_cost.value().unwrap_or(0.0),
             timestamp: SystemTime::now(),
             world_revision: world_snapshot.revision,
         };
@@ -614,9 +671,9 @@ impl PipelineEngine {
 
         let pred_err = PredictionError::compute(
             "e2e_ms",
-            selected_candidate.predicted_e2e as f64,
+            selected_candidate.predicted_e2e.value().unwrap_or(0) as f64,
             transport_resp.latency_ms as f64,
-            selected_candidate.confidence,
+            selected_candidate.confidence.value().unwrap_or(0.0),
             &req.model_version.clone().unwrap_or_else(|| "1".into()),
             world_snapshot.revision,
         );
@@ -645,56 +702,68 @@ impl PipelineEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend_registry::{BackendDescriptor, BackendRegistry};
     use crate::backend::MockBackend;
+    use crate::backend_registry::{BackendDescriptor, BackendRegistry};
     use crate::capacity::{CapacitySnapshot, ComputeNode};
-    use crate::kv::{KvIntelligence, ModelReference, KvStrategy};
     use crate::fabric::DeterministicTransport;
+    use crate::kv::{KvIntelligence, KvStrategy, ModelReference};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
-    use std::collections::{BTreeSet, BTreeMap};
 
     fn setup_engine() -> PipelineEngine {
         let world = WorldStateManager::new(Duration::from_secs(300));
         let mut backends = BackendRegistry::default();
-        
+
         let model = ModelReference::new("test-model", "1");
-        backends.register(
-            BackendDescriptor {
-                id: "backend-1".into(),
-                version: "1.0".into(),
-                capabilities: BTreeMap::from([(model.clone(), BTreeSet::from([KvStrategy::None]))]),
-            },
-            Arc::new(MockBackend {
-                name: "backend-1".into(),
-                model: model.clone(),
-                supported: vec![KvStrategy::None],
-                result: crate::backend::BackendResult {
-                    backend: "backend-1".into(),
-                    success: true,
-                    latency_ms: Some(150),
-                    estimated_cost: Some(0.01),
-                    failure: None,
+        backends
+            .register(
+                BackendDescriptor {
+                    id: "backend-1".into(),
+                    version: "1.0".into(),
+                    capabilities: BTreeMap::from([(
+                        model.clone(),
+                        BTreeSet::from([KvStrategy::None]),
+                    )]),
                 },
-            }),
-        ).unwrap();
+                Arc::new(MockBackend {
+                    name: "backend-1".into(),
+                    model: model.clone(),
+                    supported: vec![KvStrategy::None],
+                    result: crate::backend::BackendResult {
+                        backend: "backend-1".into(),
+                        success: true,
+                        latency_ms: Some(150),
+                        estimated_cost: Some(0.01),
+                        failure: None,
+                    },
+                }),
+            )
+            .unwrap();
 
         let mut capacity = CapacitySnapshot::default();
-        capacity.register(ComputeNode {
-            id: "node-1".into(),
-            region: "us-east".into(),
-            accelerator: "a100".into(),
-            total_memory_mb: 80000,
-            available_memory_mb: 70000,
-            utilization: 0.1,
-            active_requests: 0,
-            queue_depth: 0,
-            healthy: true,
-            resident_models: BTreeSet::from([model.clone()]),
-        }).unwrap();
+        capacity
+            .register(ComputeNode {
+                id: "node-1".into(),
+                region: "us-east".into(),
+                accelerator: "a100".into(),
+                total_memory_mb: 80000,
+                available_memory_mb: 70000,
+                utilization: 0.1,
+                active_requests: 0,
+                queue_depth: 0,
+                healthy: true,
+                resident_models: BTreeSet::from([model.clone()]),
+            })
+            .unwrap();
 
         let kv_intel = KvIntelligence::default();
 
-        PipelineEngine::new(world, backends, capacity, kv_intel)
+        let state_store = Arc::new(crate::fabric::LocalStateStore {
+            capacity: Arc::new(RwLock::new(capacity)),
+            registry: Arc::new(RwLock::new(backends)),
+        });
+
+        PipelineEngine::new(world, state_store, kv_intel)
     }
 
     #[tokio::test]
@@ -702,9 +771,13 @@ mod tests {
         let engine = setup_engine();
         let mut req = PipelineRequest::new("req-1", "tenant-1", "test-model");
         req.api_key = Some("invalid".into());
-        let transport = DeterministicTransport { healthy: true, latency_ms: 100, capabilities: vec![] };
-        
-        let outcome = engine.process_request(&req, &transport, None);
+        let transport = DeterministicTransport {
+            healthy: true,
+            latency_ms: 100,
+            capabilities: vec![],
+        };
+
+        let outcome = engine.process_request(&req, &transport, None).await;
         assert!(!outcome.success);
         assert_eq!(outcome.rejection_reason.unwrap(), "Authentication failed");
     }
@@ -713,10 +786,18 @@ mod tests {
     async fn pipeline_successful_execution() {
         let engine = setup_engine();
         let req = PipelineRequest::new("req-2", "tenant-1", "test-model");
-        let transport = DeterministicTransport { healthy: true, latency_ms: 100, capabilities: vec![] };
-        
-        let outcome = engine.process_request(&req, &transport, None);
-        assert!(outcome.success, "Pipeline failed with reason: {:?}", outcome.rejection_reason);
+        let transport = DeterministicTransport {
+            healthy: true,
+            latency_ms: 100,
+            capabilities: vec![],
+        };
+
+        let outcome = engine.process_request(&req, &transport, None).await;
+        assert!(
+            outcome.success,
+            "Pipeline failed with reason: {:?}",
+            outcome.rejection_reason
+        );
         assert_eq!(outcome.selected_backend.unwrap(), "backend-1");
         assert_eq!(outcome.selected_node.unwrap(), "node-1");
         assert!(outcome.execution_result.is_some());

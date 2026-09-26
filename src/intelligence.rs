@@ -292,8 +292,8 @@ impl EwmaTracker {
             return Err(IntelligenceError::InsufficientData);
         }
         let stddev = self.variance.sqrt();
-        let confidence = (self.sample_count as f64 / (self.sample_count as f64 + 10.0))
-            .clamp(0.0, 1.0);
+        let confidence =
+            (self.sample_count as f64 / (self.sample_count as f64 + 10.0)).clamp(0.0, 1.0);
         Ok(Prediction {
             value: self.mean,
             lower_bound: (self.mean - 2.0 * stddev).max(0.0),
@@ -459,8 +459,7 @@ impl PredictionErrorTracker {
         }
         let mut sorted: Vec<f64> = self.errors.iter().map(|e| e.absolute_error).collect();
         sorted.sort_by(|a, b| a.total_cmp(b));
-        let index =
-            ((sorted.len().saturating_sub(1)) as f64 * p).round() as usize;
+        let index = ((sorted.len().saturating_sub(1)) as f64 * p).round() as usize;
         sorted[index]
     }
 }
@@ -500,20 +499,41 @@ impl DecisionConfidence {
 // Counterfactual engine
 // =========================================================================
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum OperationalValue<T> {
+    Observed(T),
+    Predicted(T),
+    Derived(T),
+    Configured(T),
+    Unknown,
+    Unavailable,
+}
+
+impl<T: Copy> OperationalValue<T> {
+    pub fn value(&self) -> Option<T> {
+        match self {
+            Self::Observed(v) | Self::Predicted(v) | Self::Derived(v) | Self::Configured(v) => {
+                Some(*v)
+            }
+            Self::Unknown | Self::Unavailable => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CounterfactualEstimate {
     pub backend_id: String,
     pub compute_node_id: String,
     pub model: String,
     pub strategy: String,
-    pub predicted_ttft: u64,
-    pub predicted_tpot: u64,
-    pub predicted_e2e: u64,
-    pub predicted_cost: f64,
-    pub predicted_failure_probability: f64,
-    pub predicted_kv_transfer: u64,
-    pub quality_risk: f64,
-    pub confidence: f64,
+    pub predicted_ttft: OperationalValue<u64>,
+    pub predicted_tpot: OperationalValue<u64>,
+    pub predicted_e2e: OperationalValue<u64>,
+    pub predicted_cost: OperationalValue<f64>,
+    pub predicted_failure_probability: OperationalValue<f64>,
+    pub predicted_kv_transfer: OperationalValue<u64>,
+    pub quality_risk: OperationalValue<f64>,
+    pub confidence: OperationalValue<f64>,
     pub feasible: bool,
     pub rejection_reason: Option<String>,
 }
@@ -529,9 +549,7 @@ pub struct CounterfactualEngine;
 
 impl CounterfactualEngine {
     /// Evaluate multiple candidates. Identity is preserved via index, not value equality.
-    pub fn evaluate(
-        candidates: Vec<CounterfactualEstimate>,
-    ) -> Vec<IndexedEstimate> {
+    pub fn evaluate(candidates: Vec<CounterfactualEstimate>) -> Vec<IndexedEstimate> {
         let mut indexed: Vec<IndexedEstimate> = candidates
             .into_iter()
             .enumerate()
@@ -557,10 +575,12 @@ impl CounterfactualEngine {
 }
 
 fn score(c: &CounterfactualEstimate) -> f64 {
-    let latency = c.predicted_e2e as f64 / 1000.0;
-    let cost = c.predicted_cost;
-    let risk = c.predicted_failure_probability;
-    let quality_penalty = 1.0 - c.quality_risk.clamp(0.0, 1.0);
+    let latency = c.predicted_e2e.value().unwrap_or(u64::MAX) as f64 / 1000.0;
+    let cost = c.predicted_cost.value().unwrap_or(f64::INFINITY);
+    let risk = c.predicted_failure_probability.value().unwrap_or(1.0);
+    let quality = c.quality_risk.value().unwrap_or(1.0);
+    let quality_penalty = 1.0 - quality.clamp(0.0, 1.0);
+
     latency + cost + risk + quality_penalty
 }
 
@@ -599,9 +619,7 @@ impl UtilityConfig {
                 "weights must be finite and non-negative",
             ));
         }
-        if !self.min_quality.is_finite()
-            || !(0.0..=1.0).contains(&self.min_quality)
-        {
+        if !self.min_quality.is_finite() || !(0.0..=1.0).contains(&self.min_quality) {
             return Err(IntelligenceError::InvalidConfiguration(
                 "min_quality must be 0.0..=1.0",
             ));
@@ -649,22 +667,46 @@ impl DecisionFirewall {
         if !candidate.feasible {
             return FirewallDecision::Rejected("INFEASIBLE_CANDIDATE");
         }
-        if candidate.predicted_ttft > self.config.max_ttft {
+        if candidate
+            .predicted_ttft
+            .value()
+            .map_or(false, |v| v > self.config.max_ttft)
+        {
             return FirewallDecision::Rejected("SLO_VIOLATION_TTFT");
         }
-        if candidate.predicted_tpot > self.config.max_tpot {
+        if candidate
+            .predicted_tpot
+            .value()
+            .map_or(false, |v| v > self.config.max_tpot)
+        {
             return FirewallDecision::Rejected("SLO_VIOLATION_TPOT");
         }
-        if candidate.predicted_e2e > self.config.max_e2e {
+        if candidate
+            .predicted_e2e
+            .value()
+            .map_or(false, |v| v > self.config.max_e2e)
+        {
             return FirewallDecision::Rejected("SLO_VIOLATION_E2E");
         }
-        if candidate.quality_risk < self.config.min_quality {
+        if candidate
+            .quality_risk
+            .value()
+            .map_or(true, |v| v < self.config.min_quality)
+        {
             return FirewallDecision::Rejected("SLO_VIOLATION_QUALITY");
         }
-        if candidate.predicted_cost > self.config.max_cost {
+        if candidate
+            .predicted_cost
+            .value()
+            .map_or(false, |v| v > self.config.max_cost)
+        {
             return FirewallDecision::Rejected("SLO_VIOLATION_COST");
         }
-        if candidate.predicted_failure_probability > self.config.max_failure_probability {
+        if candidate
+            .predicted_failure_probability
+            .value()
+            .map_or(false, |v| v > self.config.max_failure_probability)
+        {
             return FirewallDecision::Rejected("SLO_VIOLATION_RELIABILITY");
         }
         if !confidence.is_safe_for_optimization() {
@@ -773,14 +815,14 @@ mod tests {
             compute_node_id: "c-1".into(),
             model: "m-1".into(),
             strategy: "prefill-decode".into(),
-            predicted_ttft: 30,
-            predicted_tpot: 50,
-            predicted_e2e: 200,
-            predicted_cost: 0.02,
-            predicted_failure_probability: 0.05,
-            predicted_kv_transfer: 5,
-            quality_risk: 0.9,
-            confidence: 0.95,
+            predicted_ttft: OperationalValue::Predicted(30),
+            predicted_tpot: OperationalValue::Predicted(50),
+            predicted_e2e: OperationalValue::Predicted(200),
+            predicted_cost: OperationalValue::Derived(0.02),
+            predicted_failure_probability: OperationalValue::Predicted(0.05),
+            predicted_kv_transfer: OperationalValue::Predicted(5),
+            quality_risk: OperationalValue::Configured(0.9),
+            confidence: OperationalValue::Derived(0.95),
             feasible: true,
             rejection_reason: None,
         }
@@ -937,10 +979,7 @@ mod tests {
     #[test]
     fn ewma_insufficient_data_returns_error() {
         let tracker = EwmaTracker::new(0.1, 5);
-        assert_eq!(
-            tracker.predict(1),
-            Err(IntelligenceError::InsufficientData)
-        );
+        assert_eq!(tracker.predict(1), Err(IntelligenceError::InsufficientData));
     }
 
     #[test]
@@ -1037,12 +1076,7 @@ mod tests {
         let mut tracker = PredictionErrorTracker::new(100);
         for i in 1..=100 {
             tracker.record(PredictionError::compute(
-                "m",
-                0.0,
-                i as f64,
-                0.9,
-                "v1",
-                i as u64,
+                "m", 0.0, i as f64, 0.9, "v1", i as u64,
             ));
         }
         assert!(tracker.p50_error() > 0.0);
@@ -1083,11 +1117,11 @@ mod tests {
     #[test]
     fn counterfactual_preserves_candidate_identity() {
         let c1 = CounterfactualEstimate {
-            predicted_e2e: 100,
+            predicted_e2e: OperationalValue::Predicted(100),
             ..sample_candidate()
         };
         let c2 = CounterfactualEstimate {
-            predicted_e2e: 200,
+            predicted_e2e: OperationalValue::Predicted(200),
             backend_id: "b-2".into(),
             ..sample_candidate()
         };
@@ -1107,12 +1141,12 @@ mod tests {
     #[test]
     fn counterfactual_deterministic_ordering() {
         let c1 = CounterfactualEstimate {
-            predicted_e2e: 200,
+            predicted_e2e: OperationalValue::Predicted(200),
             backend_id: "b-1".into(),
             ..sample_candidate()
         };
         let c2 = CounterfactualEstimate {
-            predicted_e2e: 200,
+            predicted_e2e: OperationalValue::Predicted(200),
             backend_id: "b-2".into(),
             ..sample_candidate()
         };
@@ -1126,7 +1160,9 @@ mod tests {
     #[test]
     fn counterfactual_indistinguishable_detection() {
         let c1 = sample_candidate();
-        let c2 = CounterfactualEstimate { ..sample_candidate() };
+        let c2 = CounterfactualEstimate {
+            ..sample_candidate()
+        };
         assert!(CounterfactualEngine::are_indistinguishable(&c1, &c2));
     }
 
@@ -1139,7 +1175,11 @@ mod tests {
             max_world_state_age: Duration::from_secs(300),
         };
         assert_eq!(
-            fw.evaluate_candidate(&sample_candidate(), &fresh_world_state(), DecisionConfidence::High),
+            fw.evaluate_candidate(
+                &sample_candidate(),
+                &fresh_world_state(),
+                DecisionConfidence::High
+            ),
             FirewallDecision::Approved
         );
     }
@@ -1167,7 +1207,7 @@ mod tests {
             max_world_state_age: Duration::from_secs(300),
         };
         let mut c = sample_candidate();
-        c.predicted_ttft = 60;
+        c.predicted_ttft = OperationalValue::Predicted(60);
         assert_eq!(
             fw.evaluate_candidate(&c, &fresh_world_state(), DecisionConfidence::High),
             FirewallDecision::Rejected("SLO_VIOLATION_TTFT")
@@ -1181,7 +1221,7 @@ mod tests {
             max_world_state_age: Duration::from_secs(300),
         };
         let mut c = sample_candidate();
-        c.predicted_cost = 1.0;
+        c.predicted_cost = OperationalValue::Predicted(1.0);
         assert_eq!(
             fw.evaluate_candidate(&c, &fresh_world_state(), DecisionConfidence::High),
             FirewallDecision::Rejected("SLO_VIOLATION_COST")
@@ -1195,7 +1235,11 @@ mod tests {
             max_world_state_age: Duration::from_secs(300),
         };
         assert_eq!(
-            fw.evaluate_candidate(&sample_candidate(), &fresh_world_state(), DecisionConfidence::Low),
+            fw.evaluate_candidate(
+                &sample_candidate(),
+                &fresh_world_state(),
+                DecisionConfidence::Low
+            ),
             FirewallDecision::Rejected("LOW_CONFIDENCE")
         );
     }
@@ -1223,7 +1267,11 @@ mod tests {
             max_world_state_age: Duration::from_secs(300),
         };
         assert_eq!(
-            fw.evaluate_candidate(&sample_candidate(), &fresh_world_state(), DecisionConfidence::High),
+            fw.evaluate_candidate(
+                &sample_candidate(),
+                &fresh_world_state(),
+                DecisionConfidence::High
+            ),
             FirewallDecision::Rejected("INVALID_CONFIGURATION")
         );
     }

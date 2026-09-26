@@ -48,11 +48,12 @@ impl std::fmt::Display for BackendRegistryError {
 }
 impl std::error::Error for BackendRegistryError {}
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct BackendRegistry {
     entries: BTreeMap<String, RegisteredBackend>,
     revision: u64,
 }
+#[derive(Clone)]
 struct RegisteredBackend {
     descriptor: BackendDescriptor,
     backend: Arc<dyn InferenceBackend>,
