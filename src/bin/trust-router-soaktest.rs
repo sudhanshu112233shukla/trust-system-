@@ -141,6 +141,7 @@ async fn run_agent(router: Router, metrics: Arc<SoakMetrics>, stop: Arc<AtomicBo
             RouteDecision::Escalate(_) => {
                 metrics.escalations.fetch_add(1, Ordering::Relaxed);
             }
+            _ => {}
         }
         metrics
             .latencies

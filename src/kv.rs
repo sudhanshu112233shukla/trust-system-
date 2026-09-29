@@ -16,13 +16,21 @@ impl ModelReference {
         }
     }
 }
+/// Describes the decoding strategy for a request.
+///
+/// Currently only `NormalPrefill` is implemented. Additional variants
+/// (e.g. speculative decoding, chunked prefill) will be added here as the
+/// inference layer matures. Marked `#[non_exhaustive]` so that adding new
+/// variants is not a breaking change for downstream match expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InferenceStrategy {
     NormalPrefill,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum KvStrategy {
     None,
     PrefixCache,

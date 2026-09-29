@@ -161,6 +161,7 @@ fn handle_sidecar_connection(mut stream: TcpStream, router: Router) {
                     context.reason,
                     json_string_array(&context.failed_or_blocked_nodes)
                 ),
+                _ => "{\"decision\":\"unknown\"}".to_string(),
             };
             write_response(&mut stream, 200, &body);
         }

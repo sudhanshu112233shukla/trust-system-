@@ -541,6 +541,10 @@ impl RouteResponse {
                 reason: format!("{:?}", context.reason),
                 failed_or_blocked_nodes: context.failed_or_blocked_nodes,
             },
+            _ => Self::Escalate {
+                reason: "UnknownVariant".to_string(),
+                failed_or_blocked_nodes: vec![],
+            },
         }
     }
 }
@@ -611,6 +615,7 @@ impl Metrics {
                     tenant_metrics.false_escalations += 1;
                 }
             }
+            _ => {}
         }
         outcome
     }
@@ -842,6 +847,7 @@ impl OtelMetrics {
                     self.false_escalation_total.add(1, &attrs);
                 }
             }
+            _ => {}
         }
         self.record_node_health(tenant, router);
     }
@@ -877,6 +883,8 @@ fn node_state_value(state: NodeState) -> u64 {
         NodeState::Degraded => 1,
         NodeState::HalfOpen => 2,
         NodeState::Open => 3,
+        // Forward-compatible: any future NodeState variant maps to an unknown sentinel value.
+        _ => u64::MAX,
     }
 }
 

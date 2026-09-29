@@ -251,6 +251,7 @@ impl Edge {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NodeState {
     Healthy,
     Degraded,
@@ -393,6 +394,7 @@ pub struct Route {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum RouteDecision {
     Routed(Route),
     Escalate(EscalationContext),
@@ -408,12 +410,14 @@ pub struct EscalationContext {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum EscalationReason {
     NoFeasiblePath,
     TenantNotFound,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AuditEvent {
     Reroute {
         tenant_id: TenantId,
@@ -611,13 +615,53 @@ impl Router {
             let mut ticker = tokio::time::interval(scan_interval);
             loop {
                 ticker.tick().await;
-                router.run_recovery_probe_once(cooldown);
+                // run_recovery_probe_once acquires a write lock and iterates all
+                // tenants/nodes synchronously. Offload to a blocking thread so the
+                // async runtime is never starved under large node counts.
+                let r = router.clone();
+                tokio::task::spawn_blocking(move || r.run_recovery_probe_once(cooldown))
+                    .await
+                    .ok();
             }
         })
     }
 
     pub fn spawn_default_recovery_loop(&self) -> tokio::task::JoinHandle<()> {
         self.spawn_recovery_loop(DEFAULT_COOLDOWN, DEFAULT_COOLDOWN)
+    }
+
+    /// Spawns a background task that periodically flushes the in-memory audit
+    /// ring buffer to `path` as JSONL. This guards against event loss on process
+    /// exit or crash between on-demand flush calls.
+    ///
+    /// The handle must be aborted when the server shuts down.
+    pub fn spawn_audit_flush_loop(
+        &self,
+        path: impl AsRef<std::path::Path> + Send + Sync + 'static,
+        flush_interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let router = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(flush_interval);
+            loop {
+                ticker.tick().await;
+                let r = router.clone();
+                let p = path.as_ref().to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    let _ = r.append_audit_jsonl(p);
+                })
+                .await
+                .ok();
+            }
+        })
+    }
+
+    /// Convenience wrapper: flushes every 30 seconds to `path`.
+    pub fn spawn_default_audit_flush_loop(
+        &self,
+        path: impl AsRef<std::path::Path> + Send + Sync + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        self.spawn_audit_flush_loop(path, Duration::from_secs(30))
     }
 
     pub fn run_recovery_probe_once(&self, cooldown: Duration) -> usize {
@@ -655,6 +699,41 @@ impl Router {
         let tenant_id = tenant_id.into();
         let start = start.into();
         let goal = goal.into();
+
+        let cache_key = RouteKey {
+            start: start.clone(),
+            goal: goal.clone(),
+        };
+
+        // --- Fast path: read lock only ---
+        // Check tenant existence and cache under a shared read lock so concurrent
+        // route calls are never serialised against each other on a cache hit.
+        {
+            let state = self.read_state();
+            if !state.tenants.contains_key(&tenant_id) {
+                // Fall through to write path so the escalation event is recorded.
+            } else if let Some(cached) = state.tenants[&tenant_id].cache.get(&cache_key) {
+                let route = Route {
+                    nodes: cached.path.clone(),
+                    total_cost: cached.weight,
+                    cache_hit: true,
+                };
+                // Drop read lock before acquiring write lock for the audit event.
+                drop(state);
+                let mut wstate = self.write_state();
+                wstate.push_event(AuditEvent::Reroute {
+                    tenant_id,
+                    start,
+                    goal,
+                    path: route.nodes.clone(),
+                    total_cost: route.total_cost,
+                    cache_hit: true,
+                });
+                return RouteDecision::Routed(route);
+            }
+        }
+
+        // --- Slow path: write lock for cache miss or escalation ---
         let mut state = self.write_state();
 
         let Some(tenant) = state.tenants.get_mut(&tenant_id) else {
@@ -667,11 +746,8 @@ impl Router {
             });
         };
 
-        let cache_key = RouteKey {
-            start: start.clone(),
-            goal: goal.clone(),
-        };
-
+        // Re-check cache — another writer may have populated it between lock release
+        // and re-acquisition (double-checked locking pattern).
         if let Some(cached) = tenant.get_cached(&cache_key) {
             let route = Route {
                 nodes: cached.path,
@@ -751,7 +827,7 @@ impl Router {
         append_events_jsonl(path, &events)
     }
 
-    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, RouterState> {
+    pub(crate) fn read_state(&self) -> std::sync::RwLockReadGuard<'_, RouterState> {
         self.inner.read().expect("router lock poisoned")
     }
 
@@ -929,29 +1005,7 @@ fn normalize(value: f64, ceiling: f64) -> f64 {
     (value / ceiling).clamp(0.0, 1.0)
 }
 
-#[allow(dead_code)]
-fn json_string_array(values: &[String]) -> String {
-    let items: Vec<_> = values
-        .iter()
-        .map(|value| format!("\"{}\"", json_escape(value)))
-        .collect();
-    format!("[{}]", items.join(","))
-}
 
-#[allow(dead_code)]
-fn json_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|ch| match ch {
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            _ => vec![ch],
-        })
-        .collect()
-}
 
 fn reconstruct_path(previous: HashMap<NodeId, NodeId>, start: &str, goal: &str) -> Vec<NodeId> {
     let mut path = vec![goal.to_string()];

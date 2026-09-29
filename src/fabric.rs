@@ -44,6 +44,11 @@ pub trait DistributedStateStore: Send + Sync {
     >;
 }
 
+/// In-process implementation of [`DistributedStateStore`].
+///
+/// Fields are wrapped in `Arc` so that `fetch_capacity` and `fetch_registry`
+/// are O(1) pointer-bump clones rather than full deep copies of the snapshot
+/// data on every call.
 pub struct LocalStateStore {
     pub capacity: std::sync::Arc<std::sync::RwLock<crate::capacity::CapacitySnapshot>>,
     pub registry: std::sync::Arc<std::sync::RwLock<crate::backend_registry::BackendRegistry>>,
@@ -60,8 +65,9 @@ impl DistributedStateStore for LocalStateStore {
                 + 'a,
         >,
     > {
-        let cap = self.capacity.read().unwrap().clone();
-        Box::pin(async move { Ok(cap) })
+        // Clone only the Arc (pointer bump), then read-lock inside the future.
+        let arc = std::sync::Arc::clone(&self.capacity);
+        Box::pin(async move { Ok(arc.read().unwrap().clone()) })
     }
     fn fetch_registry<'a>(
         &'a self,
@@ -76,8 +82,8 @@ impl DistributedStateStore for LocalStateStore {
                 + 'a,
         >,
     > {
-        let reg = self.registry.read().unwrap().clone();
-        Box::pin(async move { Ok(reg) })
+        let arc = std::sync::Arc::clone(&self.registry);
+        Box::pin(async move { Ok(arc.read().unwrap().clone()) })
     }
 }
 
@@ -86,6 +92,7 @@ impl DistributedStateStore for LocalStateStore {
 // =========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FabricError {
     Timeout,
     CapabilityMismatch,
@@ -233,6 +240,7 @@ impl KvTransport for DeterministicKvTransport {
 // =========================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KvAction {
     Reuse,
     Transfer,

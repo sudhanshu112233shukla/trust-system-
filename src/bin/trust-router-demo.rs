@@ -101,6 +101,8 @@ fn print_decision(label: &str, decision: RouteDecision) {
                 context.failed_or_blocked_nodes.join(", ")
             );
         }
+        // Forward-compatible: new RouteDecision variants added under #[non_exhaustive]
+        _ => println!("   unknown decision variant"),
     }
     println!();
 }

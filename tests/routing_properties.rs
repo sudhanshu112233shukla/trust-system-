@@ -149,5 +149,6 @@ fn expect_routed(decision: RouteDecision) -> trust_router::Route {
     match decision {
         RouteDecision::Routed(route) => route,
         RouteDecision::Escalate(context) => panic!("expected route, got escalation: {context:?}"),
+        _ => panic!("unexpected route decision variant"),
     }
 }

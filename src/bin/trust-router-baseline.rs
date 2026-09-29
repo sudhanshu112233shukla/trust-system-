@@ -86,6 +86,10 @@ fn run_trust_router(seed: usize) -> RunResult {
             success: false,
             llm_calls: 1.0,
         },
+        _ => RunResult {
+            success: false,
+            llm_calls: 0.0,
+        },
     }
 }
 

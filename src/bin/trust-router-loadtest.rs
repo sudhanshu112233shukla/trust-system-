@@ -143,6 +143,8 @@ async fn run_worker(router: Router, metrics: Arc<LoadMetrics>, worker: usize) ->
                     metrics.route_escalations.fetch_add(1, Ordering::Relaxed);
                     classify_escalation(&router, &metrics);
                 }
+                // Safety net for any future RouteDecision variants added under #[non_exhaustive].
+                _ => {}
             }
         } else {
             let node = ALL_TOOL_NODES[(worker + iteration) % ALL_TOOL_NODES.len()];
