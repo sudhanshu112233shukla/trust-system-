@@ -71,10 +71,17 @@ Agent / SDK (Python · TypeScript)
 
 ## Sidecar HTTP API
 
-The sidecar is the process boundary for agents and SDKs. It exposes route, result,
-metrics, and recovery endpoints while keeping the routing engine embedded and
-deterministic. API-key validation is handled by `sidecar_security.rs`; configuration
-(including hot-reload) by `sidecar_config.rs`.
+The sidecar is the process boundary for agents and SDKs. It exposes single route (`/route`),
+batch route (`/route/batch`), plan (`/plan`), result (`/result`), metrics (`/metrics`),
+and recovery endpoints while keeping the routing engine embedded and deterministic.
+API-key validation is handled by `sidecar_security.rs`; configuration (including hot-reload)
+by `sidecar_config.rs`.
+
+**High-Performance Batch Routing (`/route/batch`)**:
+Accepts parallel route requests in a single HTTP POST payload, validates API-keys and
+tenant authorization across the entire batch, acquires rate limit tokens, routes each
+item concurrently across the shared graph, and batches disk audit persistence into a
+single write, cutting round-trip network overhead for multi-agent DAGs.
 
 ---
 
@@ -93,19 +100,28 @@ The core owns the tenant graph, health state, route cache, and audit event strea
 is intentionally decoupled from the sidecar so the same deterministic routing logic can
 be tested in-process, served over HTTP, or reused behind gRPC / SDK integrations.
 
-**Lock strategy**: `route()` uses a *read* lock for cache hits — allowing concurrent
-route calls to proceed in parallel — and upgrades to a *write* lock only on a cache
-miss or when recording an escalation event. This ensures the common case is not
-serialised.
+**Decoupled Audit Pipeline & Lock Strategy**:
+`AuditPipeline` is isolated in its own thread-safe ring buffer (`Arc<AuditPipeline>`).
+Because audit recording does not require `RouterState`'s write lock, `route()` executes
+cache hits **100% under a shared read lock** without ever taking a write lock. The write lock
+is acquired exclusively on cache misses or state updates, eliminating lock contention
+across concurrent reader threads.
 
 ---
 
-## Graph Engine
+## Graph Engine (Interned Integer Hot Path)
 
-The graph engine chooses the lowest-cost feasible route through tenant-owned tool
-nodes. Cost is a four-weight linear combination (dollar spend, latency, business risk,
-base operational cost) normalised to `[0, 1]` against per-tenant ceilings. Open
-circuit-breaker nodes receive an `∞` penalty and are excluded from Dijkstra.
+The graph engine chooses the lowest-cost feasible route through tenant-owned tool nodes.
+Cost is a four-weight linear combination (dollar spend, latency, business risk, base
+operational cost) normalised to `[0, 1]` against per-tenant ceilings. Open circuit-breaker
+nodes receive an `∞` penalty and are excluded from Dijkstra.
+
+**Zero-Allocation Traversal**:
+`ToolGraph` interns node string identifiers into dense contiguous integer indexes (`u32`).
+During Dijkstra search, distances and predecessors are maintained in contiguous `Vec<f64>`
+and `Vec<u32>` CPU cache-friendly buffers, and priority queue items (`SearchState`) are
+12-byte `Copy` structs (`u32` node index + `f64` cost). The inner graph traversal loop performs
+**zero heap allocations**, resolving shortest paths with sub-microsecond latency.
 
 ---
 

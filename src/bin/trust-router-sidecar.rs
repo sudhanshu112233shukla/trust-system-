@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .route("/route", get(route_handler).post(route_handler))
+        .route("/route/batch", post(batch_route_handler))
         .route("/plan", get(plan_handler))
         .route("/result", post(result_handler))
         .route("/force-half-open", post(force_half_open_handler))
@@ -139,6 +140,105 @@ async fn route_handler(
         },
         Err(error) => error.into_response(&request_id),
     }
+}
+
+async fn batch_route_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<BatchRouteRequest>,
+) -> Response {
+    let request_id = state.request_id();
+    if payload.requests.is_empty() {
+        return SidecarError::BadRequest("batch requests list must not be empty".into())
+            .into_response(&request_id);
+    }
+    if payload.requests.len() > 1024 {
+        return SidecarError::BadRequest("batch size exceeds limit of 1024".into())
+            .into_response(&request_id);
+    }
+
+    if let Err(error) = require_api_key(&headers, &state.api_key) {
+        return error.into_response(&request_id);
+    }
+
+    for item in &payload.requests {
+        if let Err(error) = item.validate() {
+            return error.into_response(&request_id);
+        }
+        if !state.allowed_tenants.contains(&item.tenant) {
+            return SidecarError::Forbidden.into_response(&request_id);
+        }
+    }
+
+    {
+        let mut limiter = state
+            .rate_limiter
+            .lock()
+            .expect("rate limiter lock poisoned");
+        for _ in 0..payload.requests.len() {
+            if let Err(error) = limiter.try_acquire() {
+                return SidecarError::RateLimited {
+                    retry_after_secs: error.retry_after.as_secs().max(1),
+                }
+                .into_response(&request_id);
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let mut results = Vec::with_capacity(payload.requests.len());
+    let mut total_routed = 0;
+    let mut total_escalated = 0;
+    let mut new_audit_events = Vec::new();
+
+    for item in payload.requests {
+        let route_start = Instant::now();
+        let decision = state.router.route(&item.tenant, &item.start, &item.goal);
+        let route_elapsed = route_start.elapsed();
+
+        if let Some(event) = state.router.last_audit_event() {
+            new_audit_events.push(event);
+        }
+
+        match &decision {
+            RouteDecision::Routed(_) => total_routed += 1,
+            RouteDecision::Escalate(_) => total_escalated += 1,
+            _ => total_escalated += 1,
+        }
+
+        let mut metrics = state.metrics.lock().expect("metrics lock poisoned");
+        let route_metrics =
+            metrics.record_route(&item.tenant, &decision, route_elapsed, &state.router);
+        drop(metrics);
+
+        if let Some(otel) = &state.otel {
+            otel.record_route(
+                &item.tenant,
+                &decision,
+                route_elapsed,
+                route_metrics.false_escalation,
+                route_metrics.rerouted,
+                &state.router,
+            );
+        }
+
+        results.push(RouteResponse::from_decision(decision));
+    }
+
+    if let Err(error) = append_events_jsonl(&state.audit_path, &new_audit_events) {
+        return SidecarError::Internal(format!("batch audit persistence failed: {error}"))
+            .into_response(&request_id);
+    }
+
+    let duration_us = started.elapsed().as_micros();
+    let response = BatchRouteResponse {
+        results,
+        total_routed,
+        total_escalated,
+        duration_us,
+    };
+
+    response_with_request_id(Json(response).into_response(), &request_id)
 }
 
 async fn plan_handler(
@@ -269,6 +369,35 @@ impl RouteQuery {
         validate_identifier("goal", &self.goal)?;
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchRouteItem {
+    tenant: String,
+    start: String,
+    goal: String,
+}
+
+impl BatchRouteItem {
+    fn validate(&self) -> Result<(), SidecarError> {
+        validate_identifier("tenant", &self.tenant)?;
+        validate_identifier("start", &self.start)?;
+        validate_identifier("goal", &self.goal)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchRouteRequest {
+    requests: Vec<BatchRouteItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchRouteResponse {
+    results: Vec<RouteResponse>,
+    total_routed: usize,
+    total_escalated: usize,
+    duration_us: u128,
 }
 
 #[derive(Debug, Deserialize)]

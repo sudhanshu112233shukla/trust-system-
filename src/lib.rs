@@ -501,9 +501,52 @@ pub fn append_events_jsonl(path: impl AsRef<Path>, events: &[AuditEvent]) -> io:
     Ok(events.len())
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug)]
+pub struct AuditPipeline {
+    events: std::sync::Mutex<VecDeque<AuditEvent>>,
+    capacity: usize,
+}
+
+impl AuditPipeline {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            events: std::sync::Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
+            capacity,
+        }
+    }
+
+    pub fn push(&self, event: AuditEvent) {
+        let mut events = self.events.lock().expect("audit lock poisoned");
+        if events.len() == self.capacity {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+
+    pub fn events(&self) -> Vec<AuditEvent> {
+        let events = self.events.lock().expect("audit lock poisoned");
+        events.iter().cloned().collect()
+    }
+
+    pub fn last_event(&self) -> Option<AuditEvent> {
+        let events = self.events.lock().expect("audit lock poisoned");
+        events.back().cloned()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Router {
     inner: Arc<RwLock<RouterState>>,
+    audit: Arc<AuditPipeline>,
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RouterState::default())),
+            audit: Arc::new(AuditPipeline::new(AUDIT_EVENT_MEMORY_LIMIT)),
+        }
+    }
 }
 
 impl Router {
@@ -573,7 +616,7 @@ impl Router {
             tenant.invalidate_for_node(&node_id);
         }
 
-        state.push_event(AuditEvent::HealthChanged {
+        self.audit.push(AuditEvent::HealthChanged {
             tenant_id,
             node_id,
             state: node_state,
@@ -601,7 +644,7 @@ impl Router {
         }
 
         tenant.invalidate_for_node(&node_id);
-        state.push_event(AuditEvent::RecoveryProbeOpened { tenant_id, node_id });
+        self.audit.push(AuditEvent::RecoveryProbeOpened { tenant_id, node_id });
         true
     }
 
@@ -615,9 +658,6 @@ impl Router {
             let mut ticker = tokio::time::interval(scan_interval);
             loop {
                 ticker.tick().await;
-                // run_recovery_probe_once acquires a write lock and iterates all
-                // tenants/nodes synchronously. Offload to a blocking thread so the
-                // async runtime is never starved under large node counts.
                 let r = router.clone();
                 tokio::task::spawn_blocking(move || r.run_recovery_probe_once(cooldown))
                     .await
@@ -633,8 +673,6 @@ impl Router {
     /// Spawns a background task that periodically flushes the in-memory audit
     /// ring buffer to `path` as JSONL. This guards against event loss on process
     /// exit or crash between on-demand flush calls.
-    ///
-    /// The handle must be aborted when the server shuts down.
     pub fn spawn_audit_flush_loop(
         &self,
         path: impl AsRef<std::path::Path> + Send + Sync + 'static,
@@ -681,7 +719,7 @@ impl Router {
             if let Some(tenant) = state.tenants.get_mut(tenant_id) {
                 tenant.invalidate_for_node(node_id);
             }
-            state.push_event(AuditEvent::RecoveryProbeOpened {
+            self.audit.push(AuditEvent::RecoveryProbeOpened {
                 tenant_id: tenant_id.clone(),
                 node_id: node_id.clone(),
             });
@@ -706,30 +744,27 @@ impl Router {
         };
 
         // --- Fast path: read lock only ---
-        // Check tenant existence and cache under a shared read lock so concurrent
-        // route calls are never serialised against each other on a cache hit.
+        // On cache hits, we record the audit event in the decoupled audit pipeline
+        // and return immediately WITHOUT acquiring the RouterState write lock.
         {
             let state = self.read_state();
-            if !state.tenants.contains_key(&tenant_id) {
-                // Fall through to write path so the escalation event is recorded.
-            } else if let Some(cached) = state.tenants[&tenant_id].cache.get(&cache_key) {
-                let route = Route {
-                    nodes: cached.path.clone(),
-                    total_cost: cached.weight,
-                    cache_hit: true,
-                };
-                // Drop read lock before acquiring write lock for the audit event.
-                drop(state);
-                let mut wstate = self.write_state();
-                wstate.push_event(AuditEvent::Reroute {
-                    tenant_id,
-                    start,
-                    goal,
-                    path: route.nodes.clone(),
-                    total_cost: route.total_cost,
-                    cache_hit: true,
-                });
-                return RouteDecision::Routed(route);
+            if let Some(tenant) = state.tenants.get(&tenant_id) {
+                if let Some(cached) = tenant.cache.get(&cache_key) {
+                    let route = Route {
+                        nodes: cached.path.clone(),
+                        total_cost: cached.weight,
+                        cache_hit: true,
+                    };
+                    self.audit.push(AuditEvent::Reroute {
+                        tenant_id,
+                        start,
+                        goal,
+                        path: route.nodes.clone(),
+                        total_cost: route.total_cost,
+                        cache_hit: true,
+                    });
+                    return RouteDecision::Routed(route);
+                }
             }
         }
 
@@ -737,24 +772,25 @@ impl Router {
         let mut state = self.write_state();
 
         let Some(tenant) = state.tenants.get_mut(&tenant_id) else {
-            return state.escalate(EscalationContext {
+            let context = EscalationContext {
                 tenant_id,
                 start,
                 goal,
                 reason: EscalationReason::TenantNotFound,
                 failed_or_blocked_nodes: Vec::new(),
-            });
+            };
+            self.audit.push(AuditEvent::ExplicitEscalation(context.clone()));
+            return RouteDecision::Escalate(context);
         };
 
-        // Re-check cache — another writer may have populated it between lock release
-        // and re-acquisition (double-checked locking pattern).
+        // Re-check cache under write lock (double-checked locking pattern)
         if let Some(cached) = tenant.get_cached(&cache_key) {
             let route = Route {
                 nodes: cached.path,
                 total_cost: cached.weight,
                 cache_hit: true,
             };
-            state.push_event(AuditEvent::Reroute {
+            self.audit.push(AuditEvent::Reroute {
                 tenant_id,
                 start,
                 goal,
@@ -778,7 +814,7 @@ impl Router {
                         touched_nodes: route.nodes.iter().cloned().collect(),
                     },
                 );
-                state.push_event(AuditEvent::Reroute {
+                self.audit.push(AuditEvent::Reroute {
                     tenant_id,
                     start,
                     goal,
@@ -790,23 +826,25 @@ impl Router {
             }
             None => {
                 let failed_or_blocked_nodes = tenant.blocked_nodes();
-                state.escalate(EscalationContext {
+                let context = EscalationContext {
                     tenant_id,
                     start,
                     goal,
                     reason: EscalationReason::NoFeasiblePath,
                     failed_or_blocked_nodes,
-                })
+                };
+                self.audit.push(AuditEvent::ExplicitEscalation(context.clone()));
+                RouteDecision::Escalate(context)
             }
         }
     }
 
     pub fn events(&self) -> Vec<AuditEvent> {
-        self.read_state().events.iter().cloned().collect()
+        self.audit.events()
     }
 
     pub fn last_audit_event(&self) -> Option<AuditEvent> {
-        self.read_state().events.back().cloned()
+        self.audit.last_event()
     }
 
     pub fn node_state(
@@ -839,21 +877,6 @@ impl Router {
 #[derive(Debug, Default)]
 struct RouterState {
     tenants: HashMap<TenantId, TenantState>,
-    events: VecDeque<AuditEvent>,
-}
-
-impl RouterState {
-    fn push_event(&mut self, event: AuditEvent) {
-        if self.events.len() == AUDIT_EVENT_MEMORY_LIMIT {
-            self.events.pop_front();
-        }
-        self.events.push_back(event);
-    }
-
-    fn escalate(&mut self, context: EscalationContext) -> RouteDecision {
-        self.push_event(AuditEvent::ExplicitEscalation(context.clone()));
-        RouteDecision::Escalate(context)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -915,17 +938,75 @@ pub struct CachedPath {
     pub touched_nodes: HashSet<NodeId>,
 }
 
+#[derive(Debug, Clone)]
+struct IndexedEdge {
+    to: u32,
+    base_cost: f64,
+    dollar_cost: f64,
+    latency_ms: u64,
+    risk: f64,
+    enabled: bool,
+}
+
+impl IndexedEdge {
+    fn is_valid(&self) -> bool {
+        self.base_cost.is_finite()
+            && self.dollar_cost.is_finite()
+            && self.risk.is_finite()
+            && self.base_cost >= 0.0
+            && self.dollar_cost >= 0.0
+            && self.risk >= 0.0
+    }
+
+    fn weight(&self, cost_model: TenantCostModel) -> f64 {
+        if !self.is_valid() || cost_model.validate().is_err() {
+            return f64::INFINITY;
+        }
+        let ceilings = cost_model.ceilings;
+        let weights = cost_model.weights;
+        let dollar = normalize(self.dollar_cost, ceilings.max_dollar);
+        let latency = normalize(self.latency_ms as f64, ceilings.max_latency_ms as f64);
+        let risk = self.risk.clamp(0.0, 1.0);
+        let base = normalize(self.base_cost, ceilings.max_base);
+
+        weights.w_dollar * dollar
+            + weights.w_latency * latency
+            + weights.w_risk * risk
+            + weights.w_base * base
+    }
+}
+
 #[derive(Debug, Default)]
 struct ToolGraph {
-    adjacency: HashMap<NodeId, Vec<Edge>>,
+    node_to_id: HashMap<NodeId, u32>,
+    id_to_node: Vec<NodeId>,
+    adjacency: Vec<Vec<IndexedEdge>>,
 }
 
 impl ToolGraph {
+    fn get_or_insert_node(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.node_to_id.get(name) {
+            id
+        } else {
+            let id = self.id_to_node.len() as u32;
+            self.node_to_id.insert(name.to_string(), id);
+            self.id_to_node.push(name.to_string());
+            self.adjacency.push(Vec::new());
+            id
+        }
+    }
+
     fn add_edge(&mut self, edge: Edge) {
-        self.adjacency
-            .entry(edge.from.clone())
-            .or_default()
-            .push(edge);
+        let from_id = self.get_or_insert_node(&edge.from);
+        let to_id = self.get_or_insert_node(&edge.to);
+        self.adjacency[from_id as usize].push(IndexedEdge {
+            to: to_id,
+            base_cost: edge.base_cost,
+            dollar_cost: edge.dollar_cost,
+            latency_ms: edge.latency_ms,
+            risk: edge.risk,
+            enabled: edge.enabled,
+        });
     }
 
     fn shortest_path(
@@ -935,42 +1016,62 @@ impl ToolGraph {
         start: &str,
         goal: &str,
     ) -> Option<Route> {
-        let mut distances: HashMap<NodeId, f64> = HashMap::new();
-        let mut previous: HashMap<NodeId, NodeId> = HashMap::new();
+        if start == goal {
+            return Some(Route {
+                nodes: vec![start.to_string()],
+                total_cost: 0.0,
+                cache_hit: false,
+            });
+        }
+
+        let start_id = *self.node_to_id.get(start)?;
+        let goal_id = *self.node_to_id.get(goal)?;
+
+        let num_nodes = self.id_to_node.len();
+        let mut distances: Vec<f64> = vec![f64::INFINITY; num_nodes];
+        let mut previous: Vec<u32> = vec![u32::MAX; num_nodes];
         let mut heap = BinaryHeap::new();
 
-        distances.insert(start.to_string(), 0.0);
+        distances[start_id as usize] = 0.0;
         heap.push(SearchState {
-            node: start.to_string(),
+            node: start_id,
             cost: 0.0,
         });
 
         while let Some(SearchState { node, cost }) = heap.pop() {
-            if node == goal {
+            if node == goal_id {
+                let mut path = Vec::new();
+                let mut curr = goal_id;
+                while curr != u32::MAX {
+                    path.push(self.id_to_node[curr as usize].clone());
+                    if curr == start_id {
+                        break;
+                    }
+                    curr = previous[curr as usize];
+                }
+                path.reverse();
                 return Some(Route {
-                    nodes: reconstruct_path(previous, start, goal),
+                    nodes: path,
                     total_cost: cost,
                     cache_hit: false,
                 });
             }
 
-            if cost > *distances.get(&node).unwrap_or(&f64::INFINITY) {
+            if cost > distances[node as usize] {
                 continue;
             }
 
-            let Some(edges) = self.adjacency.get(&node) else {
-                continue;
-            };
-
-            for edge in edges {
+            for edge in &self.adjacency[node as usize] {
                 if !edge.enabled {
                     continue;
                 }
 
+                let target_node_name = &self.id_to_node[edge.to as usize];
                 let health_penalty = health
-                    .get(&edge.to)
+                    .get(target_node_name)
                     .map(HealthTracker::penalty)
                     .unwrap_or(0.0);
+
                 if !edge.is_valid() {
                     continue;
                 }
@@ -981,12 +1082,11 @@ impl ToolGraph {
                 }
 
                 let next_cost = cost + edge_cost;
-                let best_known = distances.get(&edge.to).copied().unwrap_or(f64::INFINITY);
-                if next_cost < best_known {
-                    distances.insert(edge.to.clone(), next_cost);
-                    previous.insert(edge.to.clone(), node.clone());
+                if next_cost < distances[edge.to as usize] {
+                    distances[edge.to as usize] = next_cost;
+                    previous[edge.to as usize] = node;
                     heap.push(SearchState {
-                        node: edge.to.clone(),
+                        node: edge.to,
                         cost: next_cost,
                     });
                 }
@@ -1005,33 +1105,15 @@ fn normalize(value: f64, ceiling: f64) -> f64 {
     (value / ceiling).clamp(0.0, 1.0)
 }
 
-
-
-fn reconstruct_path(previous: HashMap<NodeId, NodeId>, start: &str, goal: &str) -> Vec<NodeId> {
-    let mut path = vec![goal.to_string()];
-    let mut cursor = goal;
-
-    while cursor != start {
-        let Some(prev) = previous.get(cursor) else {
-            break;
-        };
-        path.push(prev.clone());
-        cursor = prev;
-    }
-
-    path.reverse();
-    path
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RouteKey {
     start: NodeId,
     goal: NodeId,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq)]
 struct SearchState {
-    node: NodeId,
+    node: u32,
     cost: f64,
 }
 
