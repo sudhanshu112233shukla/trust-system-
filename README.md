@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ TRUST ROUTER ⚡
+#  TRUST ROUTER 
 ### High-Concurrency, Deterministic Inference Control & Fault-Tolerant Routing for AI Agents
 
 [![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
@@ -22,7 +22,7 @@
 
 <br/>
 
-## 🌟 Why Trust Router?
+##  Why Trust Router?
 
 Modern agentic workflows and multi-LLM systems fail silently under production chaos: cascading GPU timeouts, cache thrashing, uncoordinated failovers, and untracked API costs. 
 
@@ -41,7 +41,7 @@ Modern agentic workflows and multi-LLM systems fail silently under production ch
 
 ---
 
-## 🏛 System Architecture
+##  System Architecture
 
 ```
 Agent Applications / Multi-Agent Swarms / SDKs
@@ -65,7 +65,7 @@ Agent Applications / Multi-Agent Swarms / SDKs
 │   [05] KV Cache Intelligence (Reuse / Transfer / Recompute) │
 │   [06] Counterfactual Inference Latency & Cost Prediction   │
 │   [07] Multi-Objective Utility Scoring (P50/P90/P99)        │
-│   [08] 🛡️  DECISION FIREWALL (Hard SLO Gating - No Bypass)  │
+│   [08]   DECISION FIREWALL (Hard SLO Gating - No Bypass)  │
 │   [09] Immutable ExecutionPlan Compilation                  │
 │   [10] Inference Transport & Real-Telemetry Feedback Loop   │
 └──────────────────────────────┬──────────────────────────────┘
@@ -74,10 +74,10 @@ Agent Applications / Multi-Agent Swarms / SDKs
 ┌─────────────────────────────────────────────────────────────┐
 │                  Router Core Engine (lib.rs)                │
 │                                                             │
-│   ⚡ Fast-Path: Shared Read-Lock Cache Hit (Zero Write-Lock) │
-│   🎯 Zero-Allocation Interned Integer Dijkstra Solver       │
-│   🧠 Node-Scoped Cache Invalidation (Touch-Tracking LRU)    │
-│   📊 Decoupled Thread-Safe Audit Pipeline Ring Buffer       │
+│    Fast-Path: Shared Read-Lock Cache Hit (Zero Write-Lock) │
+│    Zero-Allocation Interned Integer Dijkstra Solver       │
+│    Node-Scoped Cache Invalidation (Touch-Tracking LRU)    │
+│    Decoupled Thread-Safe Audit Pipeline Ring Buffer       │
 └──────────────────────────────┬──────────────────────────────┘
                                │
              ┌─────────────────┴─────────────────┐
@@ -92,24 +92,24 @@ Agent Applications / Multi-Agent Swarms / SDKs
 
 ---
 
-## 🚀 Key Features
+##  Key Features
 
-### 1. ⚡ Zero-Write-Lock Route Fast Path
+### 1.  Zero-Write-Lock Route Fast Path
 Reads proceed concurrently without acquiring the global `RouterState` write lock. By decoupling the `AuditPipeline` into its own isolated synchronization boundary, **100% of route cache hits run concurrently under a shared read lock**.
 
-### 2. 🎯 Zero-Allocation Interned Integer Dijkstra
+### 2.  Zero-Allocation Interned Integer Dijkstra
 Node string identifiers are mapped to dense, cache-friendly `u32` integer indices. Priority queue entries (`SearchState`) are compact 12-byte `Copy` structs (`u32` + `f64`), executing the entire Dijkstra relaxation loop directly on CPU cache lines with **zero heap allocations**.
 
-### 3. 🛡️ 4-State Adaptive Circuit Breaker
+### 3.  4-State Adaptive Circuit Breaker
 Transitions nodes across `Healthy`, `Degraded`, `Open`, and `HalfOpen` states based on configurable failure thresholds, recovery success thresholds, and cooldown durations:
 - **Degraded**: Remains routable with additive cost penalty.
 - **Open**: Completely fenced out of path evaluation (`f64::INFINITY`).
 - **HalfOpen**: Automated background probe tasks gently reintroduce healthy nodes.
 
-### 4. 📦 High-Performance Batch Routing (`/route/batch`)
+### 4.  High-Performance Batch Routing (`/route/batch`)
 Execute entire multi-agent DAGs or parallel tool chains in a single round-trip. Performs up-front batch authentication, collective rate limiting, parallel graph evaluation, and single-write disk audit logging.
 
-### 5. 📜 Tamper-Evident Audit WAL
+### 5.  Tamper-Evident Audit WAL
 Every route, reroute, health transition, and escalation is immutably committed with:
 - SHA-256 tamper-evident hash chaining.
 - Atomic append-only JSONL write-ahead logs.
@@ -119,7 +119,7 @@ Every route, reroute, health transition, and escalation is immutably committed w
 
 ---
 
-## 💻 Quick Start
+##  Quick Start
 
 ### Prerequisites
 - **Rust 1.85+** (2024 Edition)
@@ -155,7 +155,7 @@ cargo run --bin trust-router-demo
 
 ---
 
-## 🌐 Sidecar HTTP API
+##  Sidecar HTTP API
 
 The sidecar runs on high-performance `Axum` and `Tokio`, providing sub-millisecond HTTP routing endpoints.
 
@@ -283,7 +283,7 @@ fn main() {
 
 ---
 
-## 📊 Performance & Benchmarks
+##  Performance & Benchmarks
 
 | Metric | Measured Value | Architecture Technique |
 | :--- | :--- | :--- |
@@ -331,7 +331,7 @@ testsys/
 
 ---
 
-## 🧪 Comprehensive Verification Suite
+##  Comprehensive Verification Suite
 
 Run all test suites locally:
 
@@ -350,7 +350,7 @@ cargo run --bin trust-router-planner-benchmark
 
 ---
 
-## 🔒 Security & Privacy
+##  Security & Privacy
 
 - **Zero Prompt Retention**: No user prompts, embeddings, or sensitive payloads are retained in memory or telemetry records.
 - **Constant-Time Comparison**: API keys are authenticated using constant-time byte comparisons to prevent timing attacks.
@@ -361,7 +361,7 @@ cargo run --bin trust-router-planner-benchmark
 
 ---
 
-## 📄 License
+##  License
 
 Licensed under the [MIT License](LICENSE).
 Distributed with guarantee of deterministic safety and production performance.
